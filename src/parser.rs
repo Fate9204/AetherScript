@@ -281,6 +281,56 @@ mod tests {
     }
 
     #[test]
+    fn greater_than_binds_looser_than_subtraction_and_division() {
+        assert_eq!(
+            parse("x = a == b > c - d / e").unwrap(),
+            [Statement::Assign {
+                name: "x",
+                value: binary(
+                    BinaryOp::Equal,
+                    Expression::Ident("a"),
+                    binary(
+                        BinaryOp::Greater,
+                        Expression::Ident("b"),
+                        binary(
+                            BinaryOp::Subtract,
+                            Expression::Ident("c"),
+                            binary(
+                                BinaryOp::Divide,
+                                Expression::Ident("d"),
+                                Expression::Ident("e")
+                            ),
+                        ),
+                    ),
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn less_than_binds_looser_than_addition() {
+        assert_eq!(
+            parse("x = a == b < c + d").unwrap(),
+            [Statement::Assign {
+                name: "x",
+                value: binary(
+                    BinaryOp::Equal,
+                    Expression::Ident("a"),
+                    binary(
+                        BinaryOp::Less,
+                        Expression::Ident("b"),
+                        binary(
+                            BinaryOp::Add,
+                            Expression::Ident("c"),
+                            Expression::Ident("d")
+                        ),
+                    ),
+                ),
+            }]
+        );
+    }
+
+    #[test]
     fn parses_print_statement_over_multiple_lines() {
         assert_eq!(
             parse("x = 10 \n\n print(x > 3)\r\n").unwrap(),
