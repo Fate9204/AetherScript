@@ -1,7 +1,9 @@
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::panic;
+use std::process::ExitCode;
 use std::thread;
 
 use aetherscript::compiler::Compiler;
@@ -32,25 +34,58 @@ impl Engine {
     }
 }
 
-fn select_engine(mut arguments: impl Iterator<Item = String>) -> Engine {
-    if arguments.any(|argument| argument == "--tree") {
+fn select_engine(arguments: &[String]) -> Engine {
+    if arguments.iter().any(|argument| argument == "--tree") {
         Engine::TreeWalker(Environment::global())
     } else {
         Engine::Bytecode(VirtualMachine::default())
     }
 }
 
-fn main() -> io::Result<()> {
+fn script_path(arguments: &[String]) -> Option<&str> {
+    arguments
+        .iter()
+        .map(String::as_str)
+        .find(|argument| !argument.starts_with("--"))
+}
+
+fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     let session = thread::Builder::new()
         .stack_size(INTERPRETER_STACK_BYTES)
-        .spawn(move || {
-            let engine = select_engine(arguments.into_iter());
-            repl(io::stdin().lock(), io::stdout(), io::stderr(), engine)
-        })?;
-    session
-        .join()
-        .unwrap_or_else(|payload| panic::resume_unwind(payload))
+        .spawn(move || launch(&arguments).map_err(|error| error.to_string()));
+    let outcome = match session {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|payload| panic::resume_unwind(payload)),
+        Err(error) => Err(error.to_string()),
+    };
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn launch(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let engine = select_engine(arguments);
+    match script_path(arguments) {
+        Some(path) => run_script(path, engine, &mut io::stdout().lock()),
+        None => Ok(repl(
+            io::stdin().lock(),
+            io::stdout(),
+            io::stderr(),
+            engine,
+        )?),
+    }
+}
+
+fn run_script(path: &str, mut engine: Engine, out: &mut impl Write) -> Result<(), Box<dyn Error>> {
+    let source =
+        fs::read_to_string(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    engine.run(source.strip_prefix('\u{feff}').unwrap_or(&source), out)
 }
 
 fn repl(
@@ -103,6 +138,20 @@ fn block_delta(line: &str) -> isize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn run_file(name: &str, contents: &[u8], engine: Engine) -> (Result<(), String>, String) {
+        let path = env::temp_dir().join(format!("aetherscript-{}-{name}.ae", std::process::id()));
+        fs::write(&path, contents).unwrap();
+        let mut out = Vec::new();
+        let result =
+            run_script(path.to_str().unwrap(), engine, &mut out).map_err(|error| error.to_string());
+        fs::remove_file(&path).unwrap();
+        (result, String::from_utf8(out).unwrap())
+    }
 
     fn session(input: &[u8]) -> (String, String) {
         session_with(input, Engine::TreeWalker(Environment::global()))
@@ -178,17 +227,92 @@ mod tests {
 
     #[test]
     fn the_bytecode_engine_is_the_default_and_tree_selects_the_tree_walker() {
+        assert!(matches!(select_engine(&[]), Engine::Bytecode(_)));
         assert!(matches!(
-            select_engine(std::iter::empty()),
-            Engine::Bytecode(_)
-        ));
-        assert!(matches!(
-            select_engine(["--tree".to_owned()].into_iter()),
+            select_engine(&arguments(&["--tree"])),
             Engine::TreeWalker(_)
         ));
         assert!(matches!(
-            select_engine(["--vm".to_owned()].into_iter()),
+            select_engine(&arguments(&["--vm"])),
             Engine::Bytecode(_)
         ));
+    }
+
+    #[test]
+    fn the_script_path_is_the_first_argument_that_is_not_a_flag() {
+        assert_eq!(script_path(&arguments(&["a.ae"])), Some("a.ae"));
+        assert_eq!(script_path(&arguments(&["--tree", "a.ae"])), Some("a.ae"));
+        assert_eq!(script_path(&arguments(&["a.ae", "--tree"])), Some("a.ae"));
+        assert_eq!(script_path(&arguments(&["--vm"])), None);
+        assert_eq!(script_path(&[]), None);
+    }
+
+    #[test]
+    fn a_script_file_runs_through_the_bytecode_engine_and_prints_its_output() {
+        let script = b"x = 5\ny = 10\nwhile x < y:\nx = x + 1\nprint(x)\nend\nprint(x * 2)\n";
+        let (result, out) = run_file("loop", script, Engine::Bytecode(VirtualMachine::default()));
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "6\n7\n8\n9\n10\n20\n");
+    }
+
+    #[test]
+    fn a_script_file_can_use_the_full_language_with_the_tree_walker() {
+        let script =
+            b"def double(n):\nreturn n * 2\nend\nxs = [1, 2]\nxs.push(double(21))\nprint(xs)\n";
+        let (result, out) = run_file("tree", script, Engine::TreeWalker(Environment::global()));
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "[1, 2, 42]\n");
+    }
+
+    #[test]
+    fn a_script_with_windows_line_endings_and_a_byte_order_mark_runs() {
+        let script = b"\xEF\xBB\xBFx = 2\r\nprint(x * 21)\r\n";
+        let (result, out) = run_file(
+            "windows",
+            script,
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn a_failing_script_keeps_the_output_written_before_the_error() {
+        let (result, out) = run_file(
+            "runtime-error",
+            b"print(1)\nprint(2 / 0)\nprint(3)\n",
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(result, Err("division by zero".to_owned()));
+        assert_eq!(out, "1\n");
+    }
+
+    #[test]
+    fn a_script_with_a_syntax_error_reports_the_line() {
+        let (result, out) = run_file(
+            "syntax-error",
+            b"x = 1\ny = )\n",
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(
+            result,
+            Err("line 2: expected expression, found `)`".to_owned())
+        );
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn a_missing_script_is_reported_with_its_path() {
+        let error = run_script(
+            "does-not-exist.ae",
+            Engine::Bytecode(VirtualMachine::default()),
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("cannot read does-not-exist.ae: "),
+            "{error}"
+        );
     }
 }
