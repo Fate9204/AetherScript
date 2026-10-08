@@ -480,7 +480,36 @@ mod tests {
         assert!(!color_allowed(&arguments(&["a.ae", "--no-color"]), None));
     }
 
-    const PRIMES: &str = include_str!("../tests/primes.ae");
+    const PRIMES: &str = r"limit = 20
+num = 2
+
+while num <= limit:
+    is_prime = 1
+    divisor = 2
+    
+    # Nested check loop
+    while divisor * divisor <= num:
+        # Check remainder using a subtraction loop
+        temp = num
+        while temp >= divisor:
+            temp = temp - divisor
+        end
+        
+        # If temp is 0, divisor divides num evenly (not prime)
+        if temp == 0:
+            is_prime = 0
+        end
+        
+        divisor = divisor + 1
+    end
+    
+    if is_prime == 1:
+        print(num)
+    end
+    
+    num = num + 1
+end
+";
     const PRIMES_BELOW_TWENTY: &str = "2\n3\n5\n7\n11\n13\n17\n19\n";
 
     #[test]

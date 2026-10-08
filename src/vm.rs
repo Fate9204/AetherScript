@@ -361,13 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn primes_below_twenty_come_out_of_the_nested_loop_program() {
-        let script = include_str!("../tests/primes.ae");
-        assert_eq!(output_of(script), "2\n3\n5\n7\n11\n13\n17\n19\n");
-        assert_eq!(outcome_of_bytecode(script), outcome_of_tree_walker(script));
-    }
-
-    #[test]
     fn bytecode_matches_the_tree_walker_on_if_and_the_new_comparisons() {
         let scripts = [
             "x = 3\nif x <= 3:\nprint(1)\nelse:\nprint(2)\nend",
