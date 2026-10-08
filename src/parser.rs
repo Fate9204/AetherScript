@@ -97,26 +97,41 @@ impl<'a> Parser<'a> {
                 self.expect_peek(Token::RParen)?;
                 Statement::Print(value)
             }
+            Token::If => {
+                self.advance();
+                let condition = self.parse_expression(LOWEST_BINDING)?;
+                self.expect_block_opening()?;
+                let then_body = self.parse_block(&[Token::Else, Token::End])?;
+                let else_body = if self.current_token == Token::Else {
+                    self.expect_block_opening()?;
+                    self.parse_block(&[Token::End])?
+                } else {
+                    Vec::new()
+                };
+                Statement::If {
+                    condition,
+                    then_body,
+                    else_body,
+                }
+            }
             Token::While => {
                 self.advance();
                 let condition = self.parse_expression(LOWEST_BINDING)?;
-                self.expect_peek(Token::Colon)?;
-                self.expect_peek(Token::Newline)?;
+                self.expect_block_opening()?;
                 Statement::While {
                     condition,
-                    body: self.parse_block()?,
+                    body: self.parse_block(&[Token::End])?,
                 }
             }
             Token::Def => {
                 let name = self.expect_ident("function name")?;
                 self.expect_peek(Token::LParen)?;
                 let params = self.parse_list(Token::RParen, Self::parse_parameter)?;
-                self.expect_peek(Token::Colon)?;
-                self.expect_peek(Token::Newline)?;
+                self.expect_block_opening()?;
                 Statement::FunctionDef {
                     name,
                     params,
-                    body: self.parse_block()?,
+                    body: self.parse_block(&[Token::End])?,
                 }
             }
             Token::Return => {
@@ -136,18 +151,25 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_block(&mut self) -> Result<Vec<Statement>, ParseError> {
+    fn expect_block_opening(&mut self) -> Result<(), ParseError> {
+        self.expect_peek(Token::Colon)?;
+        self.expect_peek(Token::Newline)
+    }
+
+    fn parse_block(&mut self, closers: &[Token<'_>]) -> Result<Vec<Statement>, ParseError> {
         let mut body = Vec::new();
         loop {
             self.advance();
             while self.current_token == Token::Newline {
                 self.advance();
             }
-            match self.current_token {
-                Token::End => return Ok(body),
-                Token::Eof => return Err(self.error_at_current("`end`")),
-                _ => body.push(self.parse_statement()?),
+            if closers.contains(&self.current_token) {
+                return Ok(body);
             }
+            if self.current_token == Token::Eof {
+                return Err(self.error_at_current("`end`"));
+            }
+            body.push(self.parse_statement()?);
         }
     }
 
@@ -338,8 +360,11 @@ impl<'a> Parser<'a> {
 fn infix_binding(token: Token<'_>) -> Option<(BinaryOp, u8)> {
     match token {
         Token::EqEq => Some((BinaryOp::Equal, 1)),
+        Token::NotEq => Some((BinaryOp::NotEqual, 1)),
         Token::Lt => Some((BinaryOp::Less, 2)),
+        Token::LtEq => Some((BinaryOp::LessEqual, 2)),
         Token::Gt => Some((BinaryOp::Greater, 2)),
+        Token::GtEq => Some((BinaryOp::GreaterEqual, 2)),
         Token::Plus => Some((BinaryOp::Add, 3)),
         Token::Minus => Some((BinaryOp::Subtract, 3)),
         Token::Star => Some((BinaryOp::Multiply, 4)),
@@ -830,7 +855,31 @@ mod tests {
             ("x = 1 +\n", "line 1: expected expression, found newline"),
             ("x 5", "line 1: expected `=`, found integer `5`"),
             ("= 5", "line 1: expected statement, found `=`"),
-            ("if x:", "line 1: expected statement, found `if`"),
+            ("else:", "line 1: expected statement, found `else`"),
+            ("if x:", "line 1: expected newline, found end of input"),
+            ("if x\nend", "line 1: expected `:`, found newline"),
+            ("if:\nend", "line 1: expected expression, found `:`"),
+            (
+                "if x:\nprint(1)",
+                "line 2: expected `end`, found end of input",
+            ),
+            (
+                "if x:\nelse:\nprint(1)",
+                "line 3: expected `end`, found end of input",
+            ),
+            ("if x:\nelse\nend", "line 2: expected `:`, found newline"),
+            (
+                "if x:\nelse:\nelse:\nend",
+                "line 3: expected statement, found `else`",
+            ),
+            (
+                "while x:\nelse:\nend",
+                "line 2: expected statement, found `else`",
+            ),
+            (
+                "def f():\nelse:\nend",
+                "line 2: expected statement, found `else`",
+            ),
             ("print x", "line 1: expected `(`, found identifier `x`"),
             ("print()", "line 1: expected expression, found `)`"),
             ("print(x", "line 1: expected `)`, found end of input"),
@@ -962,5 +1011,107 @@ mod tests {
                 "{source:?}"
             );
         }
+    }
+
+    fn if_statement(
+        condition: Expression,
+        then_body: Vec<Statement>,
+        else_body: Vec<Statement>,
+    ) -> Statement {
+        Statement::If {
+            condition,
+            then_body,
+            else_body,
+        }
+    }
+
+    #[test]
+    fn parses_if_with_and_without_else() {
+        assert_eq!(
+            parse("if x > 1:\nprint(x)\nend\n").unwrap(),
+            [if_statement(
+                binary(BinaryOp::Greater, ident("x"), Expression::Int(1)),
+                vec![Statement::Print(ident("x"))],
+                vec![],
+            )]
+        );
+        assert_eq!(
+            parse("if x == 1:\nprint(1)\nelse:\nprint(2)\n\nprint(3)\nend\nprint(4)").unwrap(),
+            [
+                if_statement(
+                    binary(BinaryOp::Equal, ident("x"), Expression::Int(1)),
+                    vec![Statement::Print(Expression::Int(1))],
+                    vec![
+                        Statement::Print(Expression::Int(2)),
+                        Statement::Print(Expression::Int(3)),
+                    ],
+                ),
+                Statement::Print(Expression::Int(4)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_else_belongs_to_the_nearest_open_if() {
+        assert_eq!(
+            parse("if a == 1:\nif b == 2:\nx = 1\nelse:\nx = 2\nend\nelse:\nx = 3\nend").unwrap(),
+            [if_statement(
+                binary(BinaryOp::Equal, ident("a"), Expression::Int(1)),
+                vec![if_statement(
+                    binary(BinaryOp::Equal, ident("b"), Expression::Int(2)),
+                    vec![assign("x", Expression::Int(1))],
+                    vec![assign("x", Expression::Int(2))],
+                )],
+                vec![assign("x", Expression::Int(3))],
+            )]
+        );
+    }
+
+    #[test]
+    fn ifs_nest_inside_loops_and_functions() {
+        assert_eq!(
+            parse(
+                "while a < 3:\nif a == 1:\nprint(a)\nend\nend\ndef f():\nif true:\nreturn\nend\nend"
+            )
+            .unwrap(),
+            [
+                Statement::While {
+                    condition: binary(BinaryOp::Less, ident("a"), Expression::Int(3)),
+                    body: vec![if_statement(
+                        binary(BinaryOp::Equal, ident("a"), Expression::Int(1)),
+                        vec![Statement::Print(ident("a"))],
+                        vec![],
+                    )],
+                },
+                Statement::FunctionDef {
+                    name: "f".to_owned(),
+                    params: vec![],
+                    body: vec![if_statement(
+                        Expression::Bool(true),
+                        vec![Statement::Return(None)],
+                        vec![],
+                    )],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_new_comparisons_share_the_precedence_of_their_siblings() {
+        assert_eq!(
+            parse("x = a + 1 <= b * 2 != c >= d").unwrap(),
+            [assign(
+                "x",
+                binary(
+                    BinaryOp::NotEqual,
+                    binary(
+                        BinaryOp::LessEqual,
+                        binary(BinaryOp::Add, ident("a"), Expression::Int(1)),
+                        binary(BinaryOp::Multiply, ident("b"), Expression::Int(2)),
+                    ),
+                    binary(BinaryOp::GreaterEqual, ident("c"), ident("d")),
+                )
+            )]
+        );
     }
 }

@@ -88,10 +88,14 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn compile(mut self, statements: &[Statement]) -> Result<Chunk, CompileError> {
-        for statement in statements {
-            self.compile_statement(statement)?;
-        }
+        self.compile_block(statements)?;
         Ok(self.chunk)
+    }
+
+    fn compile_block(&mut self, statements: &[Statement]) -> Result<(), CompileError> {
+        statements
+            .iter()
+            .try_for_each(|statement| self.compile_statement(statement))
     }
 
     fn compile_statement(&mut self, statement: &Statement) -> Result<(), CompileError> {
@@ -105,6 +109,11 @@ impl<'a> Compiler<'a> {
                 self.compile_expression(expression, 0)?;
                 self.emit(OpCode::Print);
             }
+            Statement::If {
+                condition,
+                then_body,
+                else_body,
+            } => self.compile_if(condition, then_body, else_body)?,
             Statement::While { condition, body } => self.compile_while(condition, body)?,
             Statement::IndexAssign { .. } => {
                 return Err(CompileError::Unsupported("index assignment"));
@@ -120,6 +129,24 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    fn compile_if(
+        &mut self,
+        condition: &Expression,
+        then_body: &[Statement],
+        else_body: &[Statement],
+    ) -> Result<(), CompileError> {
+        self.compile_expression(condition, 0)?;
+        let skip_then = self.emit_jump(OpCode::JumpIfFalse);
+        self.compile_block(then_body)?;
+        if else_body.is_empty() {
+            return self.patch_jump(skip_then);
+        }
+        let skip_else = self.emit_jump(OpCode::Jump);
+        self.patch_jump(skip_then)?;
+        self.compile_block(else_body)?;
+        self.patch_jump(skip_else)
+    }
+
     fn compile_while(
         &mut self,
         condition: &Expression,
@@ -128,9 +155,7 @@ impl<'a> Compiler<'a> {
         let loop_start = self.address()?;
         self.compile_expression(condition, 0)?;
         let exit = self.emit_jump(OpCode::JumpIfFalse);
-        for statement in body {
-            self.compile_statement(statement)?;
-        }
+        self.compile_block(body)?;
         self.emit_operand(OpCode::Jump, loop_start);
         self.patch_jump(exit)
     }
@@ -224,8 +249,11 @@ fn binary_opcode(op: BinaryOp) -> OpCode {
         BinaryOp::Multiply => OpCode::Multiply,
         BinaryOp::Divide => OpCode::Divide,
         BinaryOp::Equal => OpCode::Equal,
+        BinaryOp::NotEqual => OpCode::NotEqual,
         BinaryOp::Greater => OpCode::Greater,
+        BinaryOp::GreaterEqual => OpCode::GreaterEqual,
         BinaryOp::Less => OpCode::Less,
+        BinaryOp::LessEqual => OpCode::LessEqual,
     }
 }
 
@@ -421,5 +449,139 @@ mod tests {
         let body = "print(x)\n".repeat(usize::from(u16::MAX) / 4 + 1);
         let source = format!("x = 1\nwhile x < 2:\n{body}end");
         assert_eq!(compile(&source).unwrap_err(), CompileError::ChunkTooLarge);
+    }
+
+    #[test]
+    fn if_without_else_jumps_past_the_body_when_false() {
+        let chunk = compile("if 1 < 2:\nprint(3)\nend").unwrap();
+        let [constant, less, jump_if_false, print] = [
+            OpCode::Constant,
+            OpCode::Less,
+            OpCode::JumpIfFalse,
+            OpCode::Print,
+        ]
+        .map(u8::from);
+        assert_eq!(
+            chunk.code(),
+            [
+                constant,
+                0,
+                0,
+                constant,
+                0,
+                1,
+                less,
+                jump_if_false,
+                0,
+                14,
+                constant,
+                0,
+                2,
+                print,
+            ]
+        );
+    }
+
+    #[test]
+    fn if_with_else_skips_the_else_after_the_then_branch() {
+        let chunk = compile("if 1 < 2:\nprint(3)\nelse:\nprint(4)\nend").unwrap();
+        let [constant, less, jump_if_false, jump, print] = [
+            OpCode::Constant,
+            OpCode::Less,
+            OpCode::JumpIfFalse,
+            OpCode::Jump,
+            OpCode::Print,
+        ]
+        .map(u8::from);
+        assert_eq!(
+            chunk.code(),
+            [
+                constant,
+                0,
+                0,
+                constant,
+                0,
+                1,
+                less,
+                jump_if_false,
+                0,
+                17,
+                constant,
+                0,
+                2,
+                print,
+                jump,
+                0,
+                21,
+                constant,
+                0,
+                3,
+                print,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_else_compiles_like_no_else() {
+        let chunk = compile("if true:\nelse:\nend").unwrap();
+        let [constant, jump_if_false] = [OpCode::Constant, OpCode::JumpIfFalse].map(u8::from);
+        assert_eq!(chunk.code(), [constant, 0, 0, jump_if_false, 0, 6]);
+    }
+
+    #[test]
+    fn an_empty_then_branch_still_gets_a_jump_over_the_else() {
+        let chunk = compile("if true:\nelse:\nprint(1)\nend").unwrap();
+        let [constant, jump_if_false, jump, print] = [
+            OpCode::Constant,
+            OpCode::JumpIfFalse,
+            OpCode::Jump,
+            OpCode::Print,
+        ]
+        .map(u8::from);
+        assert_eq!(
+            chunk.code(),
+            [
+                constant,
+                0,
+                0,
+                jump_if_false,
+                0,
+                9,
+                jump,
+                0,
+                13,
+                constant,
+                0,
+                1,
+                print,
+            ]
+        );
+    }
+
+    #[test]
+    fn each_new_comparison_compiles_to_its_own_instruction() {
+        let cases = [
+            ("<=", OpCode::LessEqual),
+            (">=", OpCode::GreaterEqual),
+            ("!=", OpCode::NotEqual),
+        ];
+        for (operator, opcode) in cases {
+            let chunk = compile(&format!("x = 1 {operator} 2")).unwrap();
+            assert_eq!(chunk.code()[6], u8::from(opcode), "{operator}");
+        }
+    }
+
+    #[test]
+    fn an_if_inside_a_loop_patches_independent_targets() {
+        let chunk = compile("while 1 < 2:\nif 3 < 4:\nprint(5)\nend\nend").unwrap();
+        let code = chunk.code();
+        let operand =
+            |position: usize| usize::from(u16::from_be_bytes([code[position], code[position + 1]]));
+        let loop_exit = operand(8);
+        let if_exit = operand(18);
+        let loop_back = operand(code.len() - 2);
+        assert_eq!(loop_exit, code.len());
+        assert_eq!(if_exit, code.len() - 3);
+        assert_eq!(loop_back, 0);
     }
 }

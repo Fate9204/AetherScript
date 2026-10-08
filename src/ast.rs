@@ -7,8 +7,17 @@ pub enum BinaryOp {
     Multiply,
     Divide,
     Equal,
+    NotEqual,
     Greater,
+    GreaterEqual,
     Less,
+    LessEqual,
+}
+
+impl BinaryOp {
+    pub fn is_equality(self) -> bool {
+        matches!(self, BinaryOp::Equal | BinaryOp::NotEqual)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +65,11 @@ pub enum Statement {
         value: Expression,
     },
     Print(Expression),
+    If {
+        condition: Expression,
+        then_body: Vec<Statement>,
+        else_body: Vec<Statement>,
+    },
     While {
         condition: Expression,
         body: Vec<Statement>,
@@ -77,8 +91,11 @@ impl fmt::Display for BinaryOp {
             BinaryOp::Multiply => "*",
             BinaryOp::Divide => "/",
             BinaryOp::Equal => "==",
+            BinaryOp::NotEqual => "!=",
             BinaryOp::Greater => ">",
+            BinaryOp::GreaterEqual => ">=",
             BinaryOp::Less => "<",
+            BinaryOp::LessEqual => "<=",
         })
     }
 }

@@ -17,10 +17,13 @@ pub enum OpCode {
     Equal,
     Greater,
     Less,
+    NotEqual,
+    GreaterEqual,
+    LessEqual,
 }
 
 impl OpCode {
-    const ALL: [OpCode; 14] = [
+    const ALL: [OpCode; 17] = [
         OpCode::Constant,
         OpCode::Add,
         OpCode::Subtract,
@@ -35,6 +38,9 @@ impl OpCode {
         OpCode::Equal,
         OpCode::Greater,
         OpCode::Less,
+        OpCode::NotEqual,
+        OpCode::GreaterEqual,
+        OpCode::LessEqual,
     ];
 
     pub fn from_byte(byte: u8) -> Option<Self> {

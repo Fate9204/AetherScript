@@ -64,8 +64,11 @@ impl<'a> Lexer<'a> {
             b'-' => Token::Minus,
             b'*' => Token::Star,
             b'/' => Token::Slash,
+            b'>' if self.eat(b'=') => Token::GtEq,
             b'>' => Token::Gt,
+            b'<' if self.eat(b'=') => Token::LtEq,
             b'<' => Token::Lt,
+            b'!' if self.eat(b'=') => Token::NotEq,
             b':' => Token::Colon,
             b',' => Token::Comma,
             b'.' => Token::Dot,
@@ -73,10 +76,7 @@ impl<'a> Lexer<'a> {
             b')' => Token::RParen,
             b'[' => Token::LBracket,
             b']' => Token::RBracket,
-            b'=' if self.peek() == Some(b'=') => {
-                self.pos += 1;
-                Token::EqEq
-            }
+            b'=' if self.eat(b'=') => Token::EqEq,
             b'=' => Token::Assign,
             b'\n' => {
                 self.line += 1;
@@ -88,6 +88,14 @@ impl<'a> Lexer<'a> {
                 Token::Illegal
             }
         }
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        let found = self.peek() == Some(byte);
+        if found {
+            self.pos += 1;
+        }
+        found
     }
 
     fn peek(&self) -> Option<u8> {
@@ -392,5 +400,44 @@ mod tests {
         let mut lexer = Lexer::new("");
         assert_eq!(lexer.next_token(), Token::Eof);
         assert_eq!(lexer.next_token(), Token::Eof);
+    }
+
+    #[test]
+    fn two_character_comparisons_are_single_tokens() {
+        assert_eq!(
+            tokenize("<= >= != == < > = !"),
+            [
+                Token::LtEq,
+                Token::GtEq,
+                Token::NotEq,
+                Token::EqEq,
+                Token::Lt,
+                Token::Gt,
+                Token::Assign,
+                Token::Illegal,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn comparisons_split_greedily_without_spaces() {
+        assert_eq!(
+            tokenize("a<=b>=c!=d"),
+            [
+                Token::Ident("a"),
+                Token::LtEq,
+                Token::Ident("b"),
+                Token::GtEq,
+                Token::Ident("c"),
+                Token::NotEq,
+                Token::Ident("d"),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(tokenize("<=="), [Token::LtEq, Token::Assign, Token::Eof]);
+        assert_eq!(tokenize("!!="), [Token::Illegal, Token::NotEq, Token::Eof]);
+        assert_eq!(tokenize("! ="), [Token::Illegal, Token::Assign, Token::Eof]);
+        assert_eq!(tokenize("< ="), [Token::Lt, Token::Assign, Token::Eof]);
     }
 }

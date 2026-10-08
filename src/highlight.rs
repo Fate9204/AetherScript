@@ -119,6 +119,18 @@ mod tests {
     }
 
     #[test]
+    fn two_character_comparisons_stay_plain_and_a_lone_bang_is_invalid() {
+        assert_eq!(
+            highlight("a <= b != c >= d"),
+            format!("{YELLOW}a{RESET} <= {YELLOW}b{RESET} != {YELLOW}c{RESET} >= {YELLOW}d{RESET}")
+        );
+        assert_eq!(
+            highlight("!x"),
+            format!("{BOLD_RED}!{RESET}{YELLOW}x{RESET}")
+        );
+    }
+
+    #[test]
     fn invalid_syntax_is_bold_red() {
         assert_eq!(
             highlight("x @ 99999999999999999999"),

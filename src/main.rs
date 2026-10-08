@@ -198,7 +198,7 @@ fn report(
 
 fn block_delta(line: &str) -> isize {
     match Lexer::new(line).next_token() {
-        Token::While | Token::Def => 1,
+        Token::If | Token::While | Token::Def => 1,
         Token::End => -1,
         _ => 0,
     }
@@ -478,5 +478,53 @@ mod tests {
         assert!(!color_allowed(&[], Some(OsStr::new("1"))));
         assert!(!color_allowed(&arguments(&["--no-color"]), None));
         assert!(!color_allowed(&arguments(&["a.ae", "--no-color"]), None));
+    }
+
+    const PRIMES: &str = include_str!("../tests/primes.ae");
+    const PRIMES_BELOW_TWENTY: &str = "2\n3\n5\n7\n11\n13\n17\n19\n";
+
+    #[test]
+    fn an_if_else_block_keeps_the_continuation_prompt_until_its_end() {
+        let (out, errors) = session_with(
+            b"x = 2\nif x == 2:\nprint(1)\nelse:\nprint(2)\nend\nprint(3)\n",
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(out, ">> >> .. .. .. .. 1\n>> 3\n>> \n");
+        assert_eq!(errors, "");
+    }
+
+    #[test]
+    fn an_else_without_an_if_is_reported_and_the_session_continues() {
+        let (out, errors) = session_with(
+            b"else:\nprint(1)\n",
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(out, ">> >> 1\n>> \n");
+        assert_eq!(errors, "error: line 1: expected statement, found `else`\n");
+    }
+
+    #[test]
+    fn the_prime_program_runs_as_a_script_on_both_engines() {
+        for engine in [
+            Engine::Bytecode(VirtualMachine::default()),
+            Engine::TreeWalker(Environment::global()),
+        ] {
+            let (result, out) = run_file("primes", PRIMES.as_bytes(), engine);
+            assert_eq!(result, Ok(()));
+            assert_eq!(out, PRIMES_BELOW_TWENTY);
+        }
+    }
+
+    #[test]
+    fn the_prime_program_can_be_pasted_into_the_repl() {
+        let (out, errors) = session_with(
+            PRIMES.as_bytes(),
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(errors, "");
+        assert_eq!(
+            out.replace(">> ", "").replace(".. ", ""),
+            format!("{PRIMES_BELOW_TWENTY}\n")
+        );
     }
 }

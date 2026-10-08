@@ -56,6 +56,9 @@ impl VirtualMachine {
                 OpCode::Equal => self.binary(BinaryOp::Equal)?,
                 OpCode::Greater => self.binary(BinaryOp::Greater)?,
                 OpCode::Less => self.binary(BinaryOp::Less)?,
+                OpCode::NotEqual => self.binary(BinaryOp::NotEqual)?,
+                OpCode::GreaterEqual => self.binary(BinaryOp::GreaterEqual)?,
+                OpCode::LessEqual => self.binary(BinaryOp::LessEqual)?,
                 OpCode::Negate => {
                     let operand = self.pop();
                     self.push(negate(operand)?);
@@ -268,7 +271,7 @@ mod tests {
             ("print(-true)", "cannot negate boolean"),
             (
                 "while 1:\nend",
-                "while condition must be a boolean, found integer",
+                "condition must be a boolean, found integer",
             ),
         ];
         for (source, message) in cases {
@@ -329,6 +332,57 @@ mod tests {
             "print(1 == true)",
             "while 1:\nend",
             "n = 3\nwhile n > 0:\nprint(n)\nn = n - 1\nend\nprint(n)",
+        ];
+        for script in scripts {
+            assert_eq!(
+                outcome_of_bytecode(script),
+                outcome_of_tree_walker(script),
+                "{script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn if_else_runs_only_the_selected_branch() {
+        let script = "x = 3\nif x <= 3:\nprint(\"le\")\nelse:\nprint(\"gt\")\nend\n\
+                      if x >= 4:\nprint(\"ge\")\nelse:\nprint(\"lt\")\nend\n\
+                      if x != 3:\nprint(\"ne\")\nend\nprint(\"done\")";
+        assert_eq!(output_of(script), "le\nlt\ndone\n");
+    }
+
+    #[test]
+    fn if_inside_a_loop_leaves_the_stack_balanced() {
+        let script =
+            "i = 0\nwhile i < 6:\nif i != 3:\nprint(i)\nelse:\nprint(100)\nend\ni = i + 1\nend";
+        assert_eq!(output_of(script), "0\n1\n2\n100\n4\n5\n");
+        let mut machine = VirtualMachine::default();
+        run(&mut machine, script).unwrap();
+        assert_eq!(machine.sp, 0);
+    }
+
+    #[test]
+    fn primes_below_twenty_come_out_of_the_nested_loop_program() {
+        let script = include_str!("../tests/primes.ae");
+        assert_eq!(output_of(script), "2\n3\n5\n7\n11\n13\n17\n19\n");
+        assert_eq!(outcome_of_bytecode(script), outcome_of_tree_walker(script));
+    }
+
+    #[test]
+    fn bytecode_matches_the_tree_walker_on_if_and_the_new_comparisons() {
+        let scripts = [
+            "x = 3\nif x <= 3:\nprint(1)\nelse:\nprint(2)\nend",
+            "if 1:\nend",
+            "if \"s\":\nprint(1)\nend",
+            "if 1 < 2:\nprint(1 / 0)\nend\nprint(2)",
+            "if 2 < 1:\nprint(1 / 0)\nend\nprint(2)",
+            "i = 0\nwhile i < 5:\nif i != 2:\nprint(i)\nend\ni = i + 1\nend",
+            "print(1 != true)",
+            "print(\"a\" <= \"b\")",
+            "print(\"a\" != \"b\")\nprint(true != true)\nprint(true >= false)",
+            "print(9223372036854775807 >= 9223372036854775807)\nprint(0 - 1 <= 0 - 2)",
+            "if true:\nelse:\nend\nprint(1)",
+            "if y:\nend",
+            "a = 1\nif a == 1:\nif a != 1:\nprint(0)\nelse:\nprint(1)\nend\nelse:\nprint(2)\nend",
         ];
         for script in scripts {
             assert_eq!(

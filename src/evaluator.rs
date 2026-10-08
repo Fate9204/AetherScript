@@ -141,7 +141,7 @@ impl fmt::Display for RuntimeError {
                 write!(f, "cannot apply `{op}` to {left} and {right}")
             }
             RuntimeError::NonBooleanCondition(found) => {
-                write!(f, "while condition must be a boolean, found {found}")
+                write!(f, "condition must be a boolean, found {found}")
             }
             RuntimeError::NotIndexable(found) => write!(f, "cannot index {found}"),
             RuntimeError::NonIntegerIndex(found) => {
@@ -292,6 +292,20 @@ fn run_statement(
             let value = eval(scope, expression, out)?;
             writeln!(out, "{value}")?;
         }
+        Statement::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            let branch = if condition_holds(scope, condition, out)? {
+                then_body
+            } else {
+                else_body
+            };
+            if let Flow::Return(value) = run_block(scope, branch, out)? {
+                return Ok(Flow::Return(value));
+            }
+        }
         Statement::While { condition, body } => {
             while condition_holds(scope, condition, out)? {
                 if let Flow::Return(value) = run_block(scope, body, out)? {
@@ -434,11 +448,11 @@ pub(crate) fn negate(value: Value) -> Result<Value, RuntimeError> {
 pub(crate) fn apply(op: BinaryOp, left: Value, right: Value) -> Result<Value, RuntimeError> {
     match (left, right) {
         (Value::Int(left), Value::Int(right)) => apply_int(op, left, right),
-        (Value::Bool(left), Value::Bool(right)) if op == BinaryOp::Equal => {
-            Ok(Value::Bool(left == right))
+        (Value::Bool(left), Value::Bool(right)) if op.is_equality() => {
+            Ok(equality(op, left == right))
         }
-        (Value::String(left), Value::String(right)) if op == BinaryOp::Equal => {
-            Ok(Value::Bool(left == right))
+        (Value::String(left), Value::String(right)) if op.is_equality() => {
+            Ok(equality(op, left == right))
         }
         (Value::String(mut left), Value::String(right)) if op == BinaryOp::Add => {
             left.push_str(&right);
@@ -604,11 +618,17 @@ pub(crate) fn apply_int(op: BinaryOp, left: i64, right: i64) -> Result<Value, Ru
         BinaryOp::Multiply => left.checked_mul(right),
         BinaryOp::Divide if right == 0 => return Err(RuntimeError::DivisionByZero),
         BinaryOp::Divide => left.checked_div(right),
-        BinaryOp::Equal => return Ok(Value::Bool(left == right)),
+        BinaryOp::Equal | BinaryOp::NotEqual => return Ok(equality(op, left == right)),
         BinaryOp::Greater => return Ok(Value::Bool(left > right)),
+        BinaryOp::GreaterEqual => return Ok(Value::Bool(left >= right)),
         BinaryOp::Less => return Ok(Value::Bool(left < right)),
+        BinaryOp::LessEqual => return Ok(Value::Bool(left <= right)),
     };
     arithmetic.map(Value::Int).ok_or(RuntimeError::Overflow)
+}
+
+fn equality(op: BinaryOp, same: bool) -> Value {
+    Value::Bool(same == (op == BinaryOp::Equal))
 }
 
 #[cfg(test)]
@@ -1057,7 +1077,7 @@ mod tests {
             ),
             (
                 "while 1:\nend",
-                "while condition must be a boolean, found integer",
+                "condition must be a boolean, found integer",
             ),
             ("print(9223372036854775807 + 1)", "integer overflow"),
             ("print(0 - 9223372036854775807 - 2)", "integer overflow"),
@@ -1162,7 +1182,7 @@ mod tests {
             ("print([1] == [1])", "cannot apply `==` to array and array"),
             (
                 "while \"x\":\nend",
-                "while condition must be a boolean, found string",
+                "condition must be a boolean, found string",
             ),
             (
                 "print(\"abc",
@@ -1217,5 +1237,110 @@ mod tests {
         let script = "def f(a):\nreturn a / 0\nend\nx = 1\nx = f(5)";
         assert!(run(&globals, script).is_err());
         assert_eq!(globals.borrow().get("x"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn if_runs_exactly_the_branch_the_condition_selects() {
+        let script = "x = 3\nif x > 2:\nprint(\"big\")\nelse:\nprint(\"small\")\nend\n\
+                      if x < 2:\nprint(\"never\")\nend\n\
+                      if x != 3:\nprint(\"no\")\nelse:\nprint(\"three\")\nend";
+        assert_eq!(output_of(script), "big\nthree\n");
+    }
+
+    #[test]
+    fn if_shares_the_enclosing_scope() {
+        assert_eq!(output_of("if true:\ny = 7\nend\nprint(y)"), "7\n");
+        let script = "def f():\nif true:\ny = 3\nend\nreturn y\nend\nprint(f())";
+        assert_eq!(output_of(script), "3\n");
+    }
+
+    #[test]
+    fn nested_if_else_chains_choose_one_branch() {
+        let script = "i = 0\nwhile i < 5:\n\
+                      if i == 0:\nprint(\"zero\")\nelse:\nif i < 3:\nprint(\"small\")\nelse:\nprint(\"large\")\nend\nend\n\
+                      i = i + 1\nend";
+        assert_eq!(output_of(script), "zero\nsmall\nsmall\nlarge\nlarge\n");
+    }
+
+    #[test]
+    fn return_inside_an_if_branch_leaves_the_function() {
+        let script = "def sign(n):\nif n < 0:\nreturn 0 - 1\nelse:\nif n == 0:\nreturn 0\nend\nend\nreturn 1\nend\n\
+                      print(sign(0 - 5))\nprint(sign(0))\nprint(sign(9))\n\
+                      def first_even(limit):\ni = 1\nwhile i <= limit:\nif i - i / 2 * 2 == 0:\nreturn i\nend\ni = i + 1\nend\nreturn 0\nend\n\
+                      print(first_even(9))\nprint(first_even(1))";
+        assert_eq!(output_of(script), "-1\n0\n1\n2\n0\n");
+    }
+
+    #[test]
+    fn recursion_can_stop_through_an_if() {
+        let script =
+            "def fact(n):\nif n <= 1:\nreturn 1\nend\nreturn n * fact(n - 1)\nend\nprint(fact(5))";
+        assert_eq!(output_of(script), "120\n");
+    }
+
+    #[test]
+    fn if_branches_work_on_arrays() {
+        let script = "xs = [3, 1, 2]\nif xs[0] >= 3:\nxs[0] = 0\nelse:\nxs[0] = 9\nend\nprint(xs)";
+        assert_eq!(output_of(script), "[0, 1, 2]\n");
+    }
+
+    #[test]
+    fn return_in_an_if_outside_a_function_is_still_rejected() {
+        assert_eq!(
+            error_of("if true:\nreturn 1\nend"),
+            "`return` outside of a function"
+        );
+    }
+
+    #[test]
+    fn the_new_comparisons_cover_integers_booleans_and_strings() {
+        let script = "print(2 <= 2)\nprint(3 <= 2)\nprint(2 >= 2)\nprint(1 >= 2)\n\
+                      print(1 != 2)\nprint(2 != 2)\nprint(true != false)\nprint(true != true)\n\
+                      print(\"a\" != \"b\")\nprint(\"a\" != \"a\")\n\
+                      print(0 - 5 <= 0 - 5)\nprint(9223372036854775807 >= 9223372036854775807)\n\
+                      print(0 - 9223372036854775807 - 1 <= 0 - 9223372036854775807)";
+        assert_eq!(
+            output_of(script),
+            "true\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\n"
+        );
+    }
+
+    #[test]
+    fn if_and_comparison_errors_name_the_offending_types() {
+        let cases = [
+            (
+                "print(1 != true)",
+                "cannot apply `!=` to integer and boolean",
+            ),
+            (
+                "print(\"a\" <= \"b\")",
+                "cannot apply `<=` to string and string",
+            ),
+            (
+                "print(true >= false)",
+                "cannot apply `>=` to boolean and boolean",
+            ),
+            ("print([1] != [1])", "cannot apply `!=` to array and array"),
+            ("if 1:\nend", "condition must be a boolean, found integer"),
+            (
+                "if \"x\":\nend",
+                "condition must be a boolean, found string",
+            ),
+            ("if y:\nend", "undefined variable `y`"),
+            ("if 1 / 0 == 1:\nend", "division by zero"),
+        ];
+        for (source, message) in cases {
+            assert_eq!(error_of(source), message, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn an_error_inside_a_branch_keeps_the_output_before_it() {
+        let globals = Environment::global();
+        let result = run(
+            &globals,
+            "print(1)\nif true:\nprint(2)\nprint(y)\nend\nprint(3)",
+        );
+        assert_eq!(result.unwrap_err().to_string(), "undefined variable `y`");
     }
 }
