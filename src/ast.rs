@@ -12,27 +12,38 @@ pub enum BinaryOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Expression<'a> {
+pub enum Expression {
     Int(i64),
-    Ident(&'a str),
+    Ident(String),
     Binary {
         op: BinaryOp,
-        left: Box<Expression<'a>>,
-        right: Box<Expression<'a>>,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
+    Call {
+        name: String,
+        arguments: Vec<Expression>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Statement<'a> {
+pub enum Statement {
     Assign {
-        name: &'a str,
-        value: Expression<'a>,
+        name: String,
+        value: Expression,
     },
-    Print(Expression<'a>),
+    Print(Expression),
     While {
-        condition: Expression<'a>,
-        body: Vec<Statement<'a>>,
+        condition: Expression,
+        body: Vec<Statement>,
     },
+    FunctionDef {
+        name: String,
+        params: Vec<String>,
+        body: Vec<Statement>,
+    },
+    Return(Option<Expression>),
+    Expression(Expression),
 }
 
 impl fmt::Display for BinaryOp {

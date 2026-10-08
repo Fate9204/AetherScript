@@ -47,7 +47,7 @@ impl<'a> Parser<'a> {
         parser
     }
 
-    pub fn parse_program(&mut self) -> Result<Vec<Statement<'a>>, ParseError> {
+    pub fn parse_program(&mut self) -> Result<Vec<Statement>, ParseError> {
         let mut statements = Vec::new();
         loop {
             while self.current_token == Token::Newline {
@@ -61,13 +61,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_statement(&mut self) -> Result<Statement<'a>, ParseError> {
+    fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let statement = match self.current_token {
+            Token::Ident(_) if self.peek_token == Token::LParen => {
+                Statement::Expression(self.parse_expression(LOWEST_BINDING)?)
+            }
             Token::Ident(name) => {
                 self.expect_peek(Token::Assign)?;
                 self.advance();
                 Statement::Assign {
-                    name,
+                    name: name.to_owned(),
                     value: self.parse_expression(LOWEST_BINDING)?,
                 }
             }
@@ -88,6 +91,27 @@ impl<'a> Parser<'a> {
                     body: self.parse_block()?,
                 }
             }
+            Token::Def => {
+                let name = self.expect_ident("function name")?;
+                self.expect_peek(Token::LParen)?;
+                let params = self.parse_list(Self::parse_parameter)?;
+                self.expect_peek(Token::Colon)?;
+                self.expect_peek(Token::Newline)?;
+                Statement::FunctionDef {
+                    name,
+                    params,
+                    body: self.parse_block()?,
+                }
+            }
+            Token::Return => {
+                let value = if matches!(self.peek_token, Token::Newline | Token::Eof) {
+                    None
+                } else {
+                    self.advance();
+                    Some(self.parse_expression(LOWEST_BINDING)?)
+                };
+                Statement::Return(value)
+            }
             _ => return Err(self.error_at_current("statement")),
         };
         match self.peek_token {
@@ -96,7 +120,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_block(&mut self) -> Result<Vec<Statement<'a>>, ParseError> {
+    fn parse_block(&mut self) -> Result<Vec<Statement>, ParseError> {
         let mut body = Vec::new();
         loop {
             self.advance();
@@ -111,7 +135,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_expression(&mut self, min_binding: u8) -> Result<Expression<'a>, ParseError> {
+    fn parse_expression(&mut self, min_binding: u8) -> Result<Expression, ParseError> {
         let mut left = self.parse_primary()?;
         while let Some((op, binding)) = infix_binding(self.peek_token)
             && binding >= min_binding
@@ -128,10 +152,19 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    fn parse_primary(&mut self) -> Result<Expression<'a>, ParseError> {
+    fn parse_primary(&mut self) -> Result<Expression, ParseError> {
         match self.current_token {
             Token::Int(value) => Ok(Expression::Int(value)),
-            Token::Ident(name) => Ok(Expression::Ident(name)),
+            Token::Ident(name) if self.peek_token == Token::LParen => {
+                self.advance();
+                let arguments =
+                    self.parse_list(|parser| parser.parse_expression(LOWEST_BINDING))?;
+                Ok(Expression::Call {
+                    name: name.to_owned(),
+                    arguments,
+                })
+            }
+            Token::Ident(name) => Ok(Expression::Ident(name.to_owned())),
             Token::LParen => {
                 self.advance();
                 let inner = self.parse_expression(LOWEST_BINDING)?;
@@ -139,6 +172,33 @@ impl<'a> Parser<'a> {
                 Ok(inner)
             }
             _ => Err(self.error_at_current("expression")),
+        }
+    }
+
+    fn parse_list<T>(
+        &mut self,
+        parse_item: impl Fn(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<Vec<T>, ParseError> {
+        let mut items = Vec::new();
+        if self.peek_token == Token::RParen {
+            self.advance();
+            return Ok(items);
+        }
+        self.advance();
+        items.push(parse_item(self)?);
+        while self.peek_token == Token::Comma {
+            self.advance();
+            self.advance();
+            items.push(parse_item(self)?);
+        }
+        self.expect_peek(Token::RParen)?;
+        Ok(items)
+    }
+
+    fn parse_parameter(&mut self) -> Result<String, ParseError> {
+        match self.current_token {
+            Token::Ident(name) => Ok(name.to_owned()),
+            _ => Err(self.error_at_current("parameter name")),
         }
     }
 
@@ -155,6 +215,14 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         Ok(())
+    }
+
+    fn expect_ident(&mut self, expected: &str) -> Result<String, ParseError> {
+        let Token::Ident(name) = self.peek_token else {
+            return Err(self.error_at_peek(expected));
+        };
+        self.advance();
+        Ok(name.to_owned())
     }
 
     fn error_at_current(&self, expected: &str) -> ParseError {
@@ -191,11 +259,22 @@ fn infix_binding(token: Token<'_>) -> Option<(BinaryOp, u8)> {
 mod tests {
     use super::*;
 
-    fn parse(source: &str) -> Result<Vec<Statement<'_>>, ParseError> {
+    fn parse(source: &str) -> Result<Vec<Statement>, ParseError> {
         Parser::new(Lexer::new(source)).parse_program()
     }
 
-    fn binary<'a>(op: BinaryOp, left: Expression<'a>, right: Expression<'a>) -> Expression<'a> {
+    fn ident(name: &str) -> Expression {
+        Expression::Ident(name.to_owned())
+    }
+
+    fn assign(name: &str, value: Expression) -> Statement {
+        Statement::Assign {
+            name: name.to_owned(),
+            value,
+        }
+    }
+
+    fn binary(op: BinaryOp, left: Expression, right: Expression) -> Expression {
         Expression::Binary {
             op,
             left: Box::new(left),
@@ -207,14 +286,14 @@ mod tests {
     fn multiplication_binds_tighter_than_addition() {
         assert_eq!(
             parse("x = 5 + 2 * 3").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Add,
                     Expression::Int(5),
                     binary(BinaryOp::Multiply, Expression::Int(2), Expression::Int(3)),
-                ),
-            }]
+                )
+            )]
         );
     }
 
@@ -222,14 +301,14 @@ mod tests {
     fn multiplication_on_the_left_groups_first() {
         assert_eq!(
             parse("x = 2 * 3 + 5").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Add,
                     binary(BinaryOp::Multiply, Expression::Int(2), Expression::Int(3)),
                     Expression::Int(5),
-                ),
-            }]
+                )
+            )]
         );
     }
 
@@ -237,9 +316,9 @@ mod tests {
     fn operators_of_equal_precedence_associate_left() {
         assert_eq!(
             parse("x = 8 / 4 / 2 - 1").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Subtract,
                     binary(
                         BinaryOp::Divide,
@@ -247,8 +326,8 @@ mod tests {
                         Expression::Int(2),
                     ),
                     Expression::Int(1),
-                ),
-            }]
+                )
+            )]
         );
     }
 
@@ -256,14 +335,14 @@ mod tests {
     fn parentheses_override_precedence() {
         assert_eq!(
             parse("x = (5 + 2) * 3").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Multiply,
                     binary(BinaryOp::Add, Expression::Int(5), Expression::Int(2)),
                     Expression::Int(3),
-                ),
-            }]
+                )
+            )]
         );
     }
 
@@ -271,18 +350,14 @@ mod tests {
     fn comparisons_bind_looser_than_arithmetic() {
         assert_eq!(
             parse("x = a + 1 == b * 2").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Equal,
-                    binary(BinaryOp::Add, Expression::Ident("a"), Expression::Int(1)),
-                    binary(
-                        BinaryOp::Multiply,
-                        Expression::Ident("b"),
-                        Expression::Int(2)
-                    ),
-                ),
-            }]
+                    binary(BinaryOp::Add, ident("a"), Expression::Int(1)),
+                    binary(BinaryOp::Multiply, ident("b"), Expression::Int(2)),
+                )
+            )]
         );
     }
 
@@ -290,18 +365,14 @@ mod tests {
     fn relational_operators_bind_tighter_than_equality() {
         assert_eq!(
             parse("x = a == b < c").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Equal,
-                    Expression::Ident("a"),
-                    binary(
-                        BinaryOp::Less,
-                        Expression::Ident("b"),
-                        Expression::Ident("c")
-                    ),
-                ),
-            }]
+                    ident("a"),
+                    binary(BinaryOp::Less, ident("b"), ident("c")),
+                )
+            )]
         );
     }
 
@@ -309,26 +380,22 @@ mod tests {
     fn greater_than_binds_looser_than_subtraction_and_division() {
         assert_eq!(
             parse("x = a == b > c - d / e").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Equal,
-                    Expression::Ident("a"),
+                    ident("a"),
                     binary(
                         BinaryOp::Greater,
-                        Expression::Ident("b"),
+                        ident("b"),
                         binary(
                             BinaryOp::Subtract,
-                            Expression::Ident("c"),
-                            binary(
-                                BinaryOp::Divide,
-                                Expression::Ident("d"),
-                                Expression::Ident("e")
-                            ),
+                            ident("c"),
+                            binary(BinaryOp::Divide, ident("d"), ident("e")),
                         ),
                     ),
-                ),
-            }]
+                )
+            )]
         );
     }
 
@@ -336,22 +403,18 @@ mod tests {
     fn less_than_binds_looser_than_addition() {
         assert_eq!(
             parse("x = a == b < c + d").unwrap(),
-            [Statement::Assign {
-                name: "x",
-                value: binary(
+            [assign(
+                "x",
+                binary(
                     BinaryOp::Equal,
-                    Expression::Ident("a"),
+                    ident("a"),
                     binary(
                         BinaryOp::Less,
-                        Expression::Ident("b"),
-                        binary(
-                            BinaryOp::Add,
-                            Expression::Ident("c"),
-                            Expression::Ident("d")
-                        ),
+                        ident("b"),
+                        binary(BinaryOp::Add, ident("c"), ident("d")),
                     ),
-                ),
-            }]
+                )
+            )]
         );
     }
 
@@ -360,15 +423,8 @@ mod tests {
         assert_eq!(
             parse("x = 10 \n\n print(x > 3)\r\n").unwrap(),
             [
-                Statement::Assign {
-                    name: "x",
-                    value: Expression::Int(10),
-                },
-                Statement::Print(binary(
-                    BinaryOp::Greater,
-                    Expression::Ident("x"),
-                    Expression::Int(3),
-                )),
+                assign("x", Expression::Int(10)),
+                Statement::Print(binary(BinaryOp::Greater, ident("x"), Expression::Int(3),)),
             ]
         );
     }
@@ -378,13 +434,10 @@ mod tests {
         assert_eq!(
             parse("while x < 3:\n print(x)\n\n x = x + 1\nend\n").unwrap(),
             [Statement::While {
-                condition: binary(BinaryOp::Less, Expression::Ident("x"), Expression::Int(3)),
+                condition: binary(BinaryOp::Less, ident("x"), Expression::Int(3)),
                 body: vec![
-                    Statement::Print(Expression::Ident("x")),
-                    Statement::Assign {
-                        name: "x",
-                        value: binary(BinaryOp::Add, Expression::Ident("x"), Expression::Int(1)),
-                    },
+                    Statement::Print(ident("x")),
+                    assign("x", binary(BinaryOp::Add, ident("x"), Expression::Int(1))),
                 ],
             }]
         );
@@ -396,26 +449,77 @@ mod tests {
             parse("while a < 1:\nwhile b < 2:\nb = 2\nend\na = 1\nend\nprint(a)").unwrap(),
             [
                 Statement::While {
-                    condition: binary(BinaryOp::Less, Expression::Ident("a"), Expression::Int(1)),
+                    condition: binary(BinaryOp::Less, ident("a"), Expression::Int(1)),
                     body: vec![
                         Statement::While {
-                            condition: binary(
-                                BinaryOp::Less,
-                                Expression::Ident("b"),
-                                Expression::Int(2),
-                            ),
-                            body: vec![Statement::Assign {
-                                name: "b",
-                                value: Expression::Int(2),
-                            }],
+                            condition: binary(BinaryOp::Less, ident("b"), Expression::Int(2),),
+                            body: vec![assign("b", Expression::Int(2))],
                         },
-                        Statement::Assign {
-                            name: "a",
-                            value: Expression::Int(1),
-                        },
+                        assign("a", Expression::Int(1)),
                     ],
                 },
-                Statement::Print(Expression::Ident("a")),
+                Statement::Print(ident("a")),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_function_definition_with_parameters() {
+        assert_eq!(
+            parse("def add(a, b):\n return a + b\nend\n").unwrap(),
+            [Statement::FunctionDef {
+                name: "add".to_owned(),
+                params: vec!["a".to_owned(), "b".to_owned()],
+                body: vec![Statement::Return(Some(binary(
+                    BinaryOp::Add,
+                    ident("a"),
+                    ident("b"),
+                )))],
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_parameterless_function_with_bare_return() {
+        assert_eq!(
+            parse("def f():\nreturn\nend").unwrap(),
+            [Statement::FunctionDef {
+                name: "f".to_owned(),
+                params: vec![],
+                body: vec![Statement::Return(None)],
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_calls_as_expressions_and_statements() {
+        assert_eq!(
+            parse("x = add(1, 2 * 3) + f()\ngreet(add(x, 1))").unwrap(),
+            [
+                assign(
+                    "x",
+                    binary(
+                        BinaryOp::Add,
+                        Expression::Call {
+                            name: "add".to_owned(),
+                            arguments: vec![
+                                Expression::Int(1),
+                                binary(BinaryOp::Multiply, Expression::Int(2), Expression::Int(3)),
+                            ],
+                        },
+                        Expression::Call {
+                            name: "f".to_owned(),
+                            arguments: vec![],
+                        },
+                    ),
+                ),
+                Statement::Expression(Expression::Call {
+                    name: "greet".to_owned(),
+                    arguments: vec![Expression::Call {
+                        name: "add".to_owned(),
+                        arguments: vec![ident("x"), Expression::Int(1)],
+                    }],
+                }),
             ]
         );
     }
@@ -478,6 +582,45 @@ mod tests {
                 "line 2: expected end of statement, found integer `1`",
             ),
             ("end", "line 1: expected statement, found `end`"),
+            (
+                "while x < 3:\nx = 1 end",
+                "line 2: expected end of statement, found `end`",
+            ),
+            ("def", "line 1: expected function name, found end of input"),
+            (
+                "def 5():\nend",
+                "line 1: expected function name, found integer `5`",
+            ),
+            ("def f:\nend", "line 1: expected `(`, found `:`"),
+            (
+                "def f(a,):\nend",
+                "line 1: expected parameter name, found `)`",
+            ),
+            (
+                "def f(1):\nend",
+                "line 1: expected parameter name, found integer `1`",
+            ),
+            (
+                "def f(a b):\nend",
+                "line 1: expected `)`, found identifier `b`",
+            ),
+            ("def f(a)\nend", "line 1: expected `:`, found newline"),
+            (
+                "def f(a): return a\nend",
+                "line 1: expected newline, found `return`",
+            ),
+            (
+                "def f():\nreturn 1",
+                "line 2: expected `end`, found end of input",
+            ),
+            ("x = f(1,)", "line 1: expected expression, found `)`"),
+            ("x = f(1 2)", "line 1: expected `)`, found integer `2`"),
+            ("f(1", "line 1: expected `)`, found end of input"),
+            ("f(1) = 2", "line 1: expected end of statement, found `=`"),
+            (
+                "return 1 2",
+                "line 1: expected end of statement, found integer `2`",
+            ),
         ];
         for (source, message) in cases {
             assert_eq!(

@@ -50,6 +50,7 @@ impl<'a> Lexer<'a> {
             b'>' => Token::Gt,
             b'<' => Token::Lt,
             b':' => Token::Colon,
+            b',' => Token::Comma,
             b'(' => Token::LParen,
             b')' => Token::RParen,
             b'=' if self.peek() == Some(b'=') => {
@@ -154,15 +155,22 @@ mod tests {
     #[test]
     fn matches_keywords_only_on_whole_words() {
         assert_eq!(
-            tokenize("if else while end print iffy _print"),
+            tokenize("if else while end def return print iffy _print end_x endless _end End END"),
             [
                 Token::If,
                 Token::Else,
                 Token::While,
                 Token::End,
+                Token::Def,
+                Token::Return,
                 Token::Print,
                 Token::Ident("iffy"),
                 Token::Ident("_print"),
+                Token::Ident("end_x"),
+                Token::Ident("endless"),
+                Token::Ident("_end"),
+                Token::Ident("End"),
+                Token::Ident("END"),
                 Token::Eof,
             ]
         );
@@ -177,6 +185,25 @@ mod tests {
                 Token::Ident("n"),
                 Token::Lt,
                 Token::Int(3),
+                Token::Colon,
+                Token::Newline,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_function_header_with_comma_separated_parameters() {
+        assert_eq!(
+            tokenize("def add(a, b):\n"),
+            [
+                Token::Def,
+                Token::Ident("add"),
+                Token::LParen,
+                Token::Ident("a"),
+                Token::Comma,
+                Token::Ident("b"),
+                Token::RParen,
                 Token::Colon,
                 Token::Newline,
                 Token::Eof,
