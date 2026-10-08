@@ -15,6 +15,7 @@ pub enum Token<'a> {
     If,
     Else,
     While,
+    End,
     Print,
     Newline,
     Colon,
@@ -30,6 +31,7 @@ impl<'a> Token<'a> {
             "if" => Token::If,
             "else" => Token::Else,
             "while" => Token::While,
+            "end" => Token::End,
             "print" => Token::Print,
             _ => Token::Ident(word),
         }
@@ -52,6 +54,7 @@ impl fmt::Display for Token<'_> {
             Token::If => f.write_str("`if`"),
             Token::Else => f.write_str("`else`"),
             Token::While => f.write_str("`while`"),
+            Token::End => f.write_str("`end`"),
             Token::Print => f.write_str("`print`"),
             Token::Newline => f.write_str("newline"),
             Token::Colon => f.write_str("`:`"),

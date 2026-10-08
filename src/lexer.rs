@@ -154,11 +154,12 @@ mod tests {
     #[test]
     fn matches_keywords_only_on_whole_words() {
         assert_eq!(
-            tokenize("if else while print iffy _print"),
+            tokenize("if else while end print iffy _print"),
             [
                 Token::If,
                 Token::Else,
                 Token::While,
+                Token::End,
                 Token::Print,
                 Token::Ident("iffy"),
                 Token::Ident("_print"),

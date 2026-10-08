@@ -1,3 +1,5 @@
+use std::fmt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -27,4 +29,22 @@ pub enum Statement<'a> {
         value: Expression<'a>,
     },
     Print(Expression<'a>),
+    While {
+        condition: Expression<'a>,
+        body: Vec<Statement<'a>>,
+    },
+}
+
+impl fmt::Display for BinaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BinaryOp::Add => "+",
+            BinaryOp::Subtract => "-",
+            BinaryOp::Multiply => "*",
+            BinaryOp::Divide => "/",
+            BinaryOp::Equal => "==",
+            BinaryOp::Greater => ">",
+            BinaryOp::Less => "<",
+        })
+    }
 }

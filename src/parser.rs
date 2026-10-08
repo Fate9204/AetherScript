@@ -78,11 +78,36 @@ impl<'a> Parser<'a> {
                 self.expect_peek(Token::RParen)?;
                 Statement::Print(value)
             }
+            Token::While => {
+                self.advance();
+                let condition = self.parse_expression(LOWEST_BINDING)?;
+                self.expect_peek(Token::Colon)?;
+                self.expect_peek(Token::Newline)?;
+                Statement::While {
+                    condition,
+                    body: self.parse_block()?,
+                }
+            }
             _ => return Err(self.error_at_current("statement")),
         };
         match self.peek_token {
             Token::Newline | Token::Eof => Ok(statement),
             _ => Err(self.error_at_peek("end of statement")),
+        }
+    }
+
+    fn parse_block(&mut self) -> Result<Vec<Statement<'a>>, ParseError> {
+        let mut body = Vec::new();
+        loop {
+            self.advance();
+            while self.current_token == Token::Newline {
+                self.advance();
+            }
+            match self.current_token {
+                Token::End => return Ok(body),
+                Token::Eof => return Err(self.error_at_current("`end`")),
+                _ => body.push(self.parse_statement()?),
+            }
         }
     }
 
@@ -349,6 +374,53 @@ mod tests {
     }
 
     #[test]
+    fn parses_while_loop_with_multi_statement_body() {
+        assert_eq!(
+            parse("while x < 3:\n print(x)\n\n x = x + 1\nend\n").unwrap(),
+            [Statement::While {
+                condition: binary(BinaryOp::Less, Expression::Ident("x"), Expression::Int(3)),
+                body: vec![
+                    Statement::Print(Expression::Ident("x")),
+                    Statement::Assign {
+                        name: "x",
+                        value: binary(BinaryOp::Add, Expression::Ident("x"), Expression::Int(1)),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_loops_close_innermost_end_first() {
+        assert_eq!(
+            parse("while a < 1:\nwhile b < 2:\nb = 2\nend\na = 1\nend\nprint(a)").unwrap(),
+            [
+                Statement::While {
+                    condition: binary(BinaryOp::Less, Expression::Ident("a"), Expression::Int(1)),
+                    body: vec![
+                        Statement::While {
+                            condition: binary(
+                                BinaryOp::Less,
+                                Expression::Ident("b"),
+                                Expression::Int(2),
+                            ),
+                            body: vec![Statement::Assign {
+                                name: "b",
+                                value: Expression::Int(2),
+                            }],
+                        },
+                        Statement::Assign {
+                            name: "a",
+                            value: Expression::Int(1),
+                        },
+                    ],
+                },
+                Statement::Print(Expression::Ident("a")),
+            ]
+        );
+    }
+
+    #[test]
     fn accepts_empty_and_blank_input() {
         assert_eq!(parse("").unwrap(), []);
         assert_eq!(parse("\n \n\t\n").unwrap(), []);
@@ -380,6 +452,32 @@ mod tests {
                 "line 1: expected expression, found illegal token",
             ),
             ("x = 1\n\ny = )", "line 3: expected expression, found `)`"),
+            (
+                "while x < 3:",
+                "line 1: expected newline, found end of input",
+            ),
+            (
+                "while x < 3:\nx = 1",
+                "line 2: expected `end`, found end of input",
+            ),
+            (
+                "while x < 3\nx = 1\nend",
+                "line 1: expected `:`, found newline",
+            ),
+            (
+                "while x < 3: x = 1\nend",
+                "line 1: expected newline, found identifier `x`",
+            ),
+            ("while:\nend", "line 1: expected expression, found `:`"),
+            (
+                "while x < 3:\nx =\nend",
+                "line 2: expected expression, found newline",
+            ),
+            (
+                "while x < 3:\nend 1",
+                "line 2: expected end of statement, found integer `1`",
+            ),
+            ("end", "line 1: expected statement, found `end`"),
         ];
         for (source, message) in cases {
             assert_eq!(
