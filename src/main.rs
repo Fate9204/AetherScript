@@ -265,6 +265,16 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_line_before_a_block_does_not_confuse_the_repl_depth() {
+        let (out, errors) = session_with(
+            b"# loop\nx = 0\nwhile x < 2: # header\nx = x + 1 # step\nend # done\nprint(x)\n",
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(out, ">> >> >> .. .. >> 2\n>> \n");
+        assert_eq!(errors, "");
+    }
+
+    #[test]
     fn a_script_with_windows_line_endings_and_a_byte_order_mark_runs() {
         let script = b"\xEF\xBB\xBFx = 2\r\nprint(x * 21)\r\n";
         let (result, out) = run_file(

@@ -200,6 +200,20 @@ mod tests {
     }
 
     #[test]
+    fn comments_are_ignored_by_the_whole_pipeline() {
+        let script = "# header\na = 10 # first value\nwhile a < 12: # loop\n    a = a + 1 # step\nend # done\nprint(a)\n";
+        assert_eq!(output_of(script), "12\n");
+    }
+
+    #[test]
+    fn a_factorial_loop_with_text_output_runs() {
+        let script = "# Calculate 5! (factorial of 5)\ntarget = 5\nresult = 1\ncounter = 1\n\n\
+                      while counter < target:\n    counter = counter + 1\n    result = result * counter\nend\n\n\
+                      print(\"Factorial result:\")\nprint(result)\n";
+        assert_eq!(output_of(script), "Factorial result:\n120\n");
+    }
+
+    #[test]
     fn loops_run_every_body_statement_each_iteration() {
         let script = "i = 1\nwhile i < 4:\nprint(i)\ni = i + 1\nend\nprint(i)";
         assert_eq!(output_of(script), "1\n2\n3\n4\n");

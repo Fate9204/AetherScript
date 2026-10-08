@@ -20,7 +20,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn next_token(&mut self) -> Token<'a> {
-        self.advance_while(|b| matches!(b, b' ' | b'\t' | b'\r'));
+        self.skip_blanks_and_comment();
 
         let Some(byte) = self.peek() else {
             return Token::Eof;
@@ -88,6 +88,13 @@ impl<'a> Lexer<'a> {
 
     fn peek(&self) -> Option<u8> {
         self.input.as_bytes().get(self.pos).copied()
+    }
+
+    fn skip_blanks_and_comment(&mut self) {
+        self.advance_while(|b| matches!(b, b' ' | b'\t' | b'\r'));
+        if self.peek() == Some(b'#') {
+            self.advance_while(|b| b != b'\n');
+        }
     }
 
     fn advance_while(&mut self, predicate: impl Fn(u8) -> bool) {
@@ -301,6 +308,35 @@ mod tests {
                 Token::RBracket,
                 Token::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn comments_run_to_the_end_of_the_line_and_keep_the_newline() {
+        assert_eq!(
+            tokenize("x = 1 # note\n# whole line\ny # tail"),
+            [
+                Token::Ident("x"),
+                Token::Assign,
+                Token::Int(1),
+                Token::Newline,
+                Token::Newline,
+                Token::Ident("y"),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(tokenize("# only a comment"), [Token::Eof]);
+        assert_eq!(
+            tokenize("# crlf\r\nx"),
+            [Token::Newline, Token::Ident("x"), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn a_hash_inside_a_string_is_text_not_a_comment() {
+        assert_eq!(
+            tokenize("\"a # b\" # real comment"),
+            [Token::String("a # b"), Token::Eof]
         );
     }
 
