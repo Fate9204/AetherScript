@@ -32,16 +32,20 @@ impl Engine {
     }
 }
 
+fn select_engine(mut arguments: impl Iterator<Item = String>) -> Engine {
+    if arguments.any(|argument| argument == "--tree") {
+        Engine::TreeWalker(Environment::global())
+    } else {
+        Engine::Bytecode(VirtualMachine::default())
+    }
+}
+
 fn main() -> io::Result<()> {
-    let bytecode = env::args().skip(1).any(|argument| argument == "--vm");
+    let arguments: Vec<String> = env::args().skip(1).collect();
     let session = thread::Builder::new()
         .stack_size(INTERPRETER_STACK_BYTES)
         .spawn(move || {
-            let engine = if bytecode {
-                Engine::Bytecode(VirtualMachine::default())
-            } else {
-                Engine::TreeWalker(Environment::global())
-            };
+            let engine = select_engine(arguments.into_iter());
             repl(io::stdin().lock(), io::stdout(), io::stderr(), engine)
         })?;
     session
@@ -170,5 +174,21 @@ mod tests {
             errors,
             "error: the bytecode compiler does not support function definitions yet\n"
         );
+    }
+
+    #[test]
+    fn the_bytecode_engine_is_the_default_and_tree_selects_the_tree_walker() {
+        assert!(matches!(
+            select_engine(std::iter::empty()),
+            Engine::Bytecode(_)
+        ));
+        assert!(matches!(
+            select_engine(["--tree".to_owned()].into_iter()),
+            Engine::TreeWalker(_)
+        ));
+        assert!(matches!(
+            select_engine(["--vm".to_owned()].into_iter()),
+            Engine::Bytecode(_)
+        ));
     }
 }
