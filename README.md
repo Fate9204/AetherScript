@@ -6,3 +6,29 @@ Developed as an academic supercurricular project to explore programming language
 
 ## 🏛️ Advanced Architecture Pipeline
 
+```text
+  📥 Raw Input String (.ae)
+            │
+            ▼
+┌─────────────────────────┐
+│ 1. Hand-Written Lexer   │ ──> Tokenizes character streams with multi-char lookahead
+└─────────────────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 2. Recursive Parser     │ ──> Builds AST enforcing math operator precedence
+└─────────────────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 3. Bytecode Compiler    │ ──> Flattens AST into linear arrays of custom OpCodes
+└─────────────────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 4. Stack-Based VM Core  │ ──> Executes bytes via virtual Instruction Pointer (ip)
+└─────────────────────────┘
+            │
+            ▼
+  🖥️ Native Execution Output (Stdout)
+```
