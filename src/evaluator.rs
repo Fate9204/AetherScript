@@ -48,7 +48,7 @@ impl Value {
         Value::Array(Rc::new(RefCell::new(items)))
     }
 
-    fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "integer",
             Value::Bool(_) => "boolean",
@@ -338,13 +338,7 @@ fn eval(
             .map(|item| eval(scope, item, out))
             .collect::<Result<_, _>>()
             .map(Value::new_array),
-        Expression::Negate(operand) => match eval(scope, operand, out)? {
-            Value::Int(value) => value
-                .checked_neg()
-                .map(Value::Int)
-                .ok_or(RuntimeError::Overflow),
-            other => Err(RuntimeError::InvalidNegation(other.type_name())),
-        },
+        Expression::Negate(operand) => negate(eval(scope, operand, out)?),
         Expression::Index { target, index } => {
             let target = eval(scope, target, out)?;
             let index = eval(scope, index, out)?;
@@ -427,7 +421,17 @@ fn condition_holds(
     }
 }
 
-fn apply(op: BinaryOp, left: Value, right: Value) -> Result<Value, RuntimeError> {
+pub(crate) fn negate(value: Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Int(value) => value
+            .checked_neg()
+            .map(Value::Int)
+            .ok_or(RuntimeError::Overflow),
+        other => Err(RuntimeError::InvalidNegation(other.type_name())),
+    }
+}
+
+pub(crate) fn apply(op: BinaryOp, left: Value, right: Value) -> Result<Value, RuntimeError> {
     match (left, right) {
         (Value::Int(left), Value::Int(right)) => apply_int(op, left, right),
         (Value::Bool(left), Value::Bool(right)) if op == BinaryOp::Equal => {
@@ -593,7 +597,7 @@ fn clamp_bound(
     })
 }
 
-fn apply_int(op: BinaryOp, left: i64, right: i64) -> Result<Value, RuntimeError> {
+pub(crate) fn apply_int(op: BinaryOp, left: i64, right: i64) -> Result<Value, RuntimeError> {
     let arithmetic = match op {
         BinaryOp::Add => left.checked_add(right),
         BinaryOp::Subtract => left.checked_sub(right),
