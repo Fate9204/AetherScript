@@ -419,8 +419,9 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                ">> {repaint}>> \x1b[33mx\x1b[0m = \x1b[36m5\x1b[0m\n\
-                 >> {repaint}>> \x1b[35mprint\x1b[0m(\x1b[33mx\x1b[0m)\n5\n>> \n"
+                ">> {repaint}>> {}\n>> {repaint}>> {}\n5\n>> \n",
+                highlight::highlight("x = 5"),
+                highlight::highlight("print(x)")
             )
         );
         assert_eq!(errors, "");
@@ -451,7 +452,10 @@ mod tests {
             Engine::Bytecode(VirtualMachine::default()),
             REDRAWING,
         );
-        assert_eq!(out, ">> \x1b[1A\r\x1b[2K>> \x1b[36m7\x1b[0m\n>> \n");
+        assert_eq!(
+            out,
+            format!(">> \x1b[1A\r\x1b[2K>> {}\n>> \n", highlight::highlight("7"))
+        );
     }
 
     #[test]
