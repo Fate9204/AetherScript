@@ -18,9 +18,20 @@ pub enum Expression {
     String(String),
     Ident(String),
     Array(Vec<Expression>),
+    Negate(Box<Expression>),
     Index {
         target: Box<Expression>,
         index: Box<Expression>,
+    },
+    Slice {
+        target: Box<Expression>,
+        start: Option<Box<Expression>>,
+        end: Option<Box<Expression>>,
+    },
+    MethodCall {
+        target: Box<Expression>,
+        method: String,
+        arguments: Vec<Expression>,
     },
     Binary {
         op: BinaryOp,
@@ -40,7 +51,7 @@ pub enum Statement {
         value: Expression,
     },
     IndexAssign {
-        name: String,
+        target: Expression,
         index: Expression,
         value: Expression,
     },

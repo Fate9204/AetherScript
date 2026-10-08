@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::rc::Rc;
 
 use crate::ast::{BinaryOp, Expression, Statement};
@@ -15,7 +16,7 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     String(String),
-    Array(Vec<Value>),
+    Array(Rc<RefCell<Vec<Value>>>),
     Unit,
     Function(Rc<Function>),
 }
@@ -43,6 +44,10 @@ impl fmt::Debug for Function {
 }
 
 impl Value {
+    fn new_array(items: Vec<Value>) -> Self {
+        Value::Array(Rc::new(RefCell::new(items)))
+    }
+
     fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "integer",
@@ -53,30 +58,43 @@ impl Value {
             Value::Function(_) => "function",
         }
     }
+
+    fn write_to(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        quoted: bool,
+        open: &mut Vec<*const RefCell<Vec<Value>>>,
+    ) -> fmt::Result {
+        match self {
+            Value::Int(value) => write!(f, "{value}"),
+            Value::Bool(value) => write!(f, "{value}"),
+            Value::String(text) if quoted => write!(f, "\"{text}\""),
+            Value::String(text) => f.write_str(text),
+            Value::Unit => f.write_str("unit"),
+            Value::Function(function) => write!(f, "<function {}>", function.name),
+            Value::Array(items) => {
+                let identity = Rc::as_ptr(items);
+                if open.contains(&identity) {
+                    return f.write_str("[...]");
+                }
+                open.push(identity);
+                f.write_str("[")?;
+                for (position, item) in items.borrow().iter().enumerate() {
+                    if position > 0 {
+                        f.write_str(", ")?;
+                    }
+                    item.write_to(f, true, open)?;
+                }
+                open.pop();
+                f.write_str("]")
+            }
+        }
+    }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Int(value) => write!(f, "{value}"),
-            Value::Bool(value) => write!(f, "{value}"),
-            Value::String(text) => f.write_str(text),
-            Value::Array(items) => {
-                f.write_str("[")?;
-                for (position, item) in items.iter().enumerate() {
-                    if position > 0 {
-                        f.write_str(", ")?;
-                    }
-                    match item {
-                        Value::String(text) => write!(f, "\"{text}\"")?,
-                        other => write!(f, "{other}")?,
-                    }
-                }
-                f.write_str("]")
-            }
-            Value::Unit => f.write_str("unit"),
-            Value::Function(function) => write!(f, "<function {}>", function.name),
-        }
+        self.write_to(f, false, &mut Vec::new())
     }
 }
 
@@ -96,6 +114,12 @@ pub enum RuntimeError {
         length: usize,
     },
     ElementAssignment(&'static str),
+    InvalidNegation(&'static str),
+    UnknownMethod {
+        receiver: &'static str,
+        method: String,
+    },
+    PopFromEmpty,
     NotCallable(String),
     ArityMismatch {
         name: String,
@@ -129,6 +153,11 @@ impl fmt::Display for RuntimeError {
             RuntimeError::ElementAssignment(found) => {
                 write!(f, "cannot assign to an element of {found}")
             }
+            RuntimeError::InvalidNegation(found) => write!(f, "cannot negate {found}"),
+            RuntimeError::UnknownMethod { receiver, method } => {
+                write!(f, "{receiver} has no method `{method}`")
+            }
+            RuntimeError::PopFromEmpty => f.write_str("pop from empty array"),
             RuntimeError::NotCallable(name) => write!(f, "`{name}` is not a function"),
             RuntimeError::ArityMismatch {
                 name,
@@ -182,20 +211,9 @@ impl Environment {
     }
 
     fn get(&self, name: &str) -> Option<Value> {
-        self.read(name, Value::clone)
-    }
-
-    fn read<R>(&self, name: &str, reader: impl FnOnce(&Value) -> R) -> Option<R> {
         match self.variables.get(name) {
-            Some(value) => Some(reader(value)),
-            None => self.parent.as_ref()?.borrow().read(name, reader),
-        }
-    }
-
-    fn modify<R>(&mut self, name: &str, modifier: impl FnOnce(&mut Value) -> R) -> Option<R> {
-        match self.variables.get_mut(name) {
-            Some(value) => Some(modifier(value)),
-            None => self.parent.as_ref()?.borrow_mut().modify(name, modifier),
+            Some(value) => Some(value.clone()),
+            None => self.parent.as_ref()?.borrow().get(name),
         }
     }
 
@@ -260,13 +278,15 @@ fn run_statement(
             let value = eval(scope, value, out)?;
             scope.borrow_mut().assign(name, value);
         }
-        Statement::IndexAssign { name, index, value } => {
+        Statement::IndexAssign {
+            target,
+            index,
+            value,
+        } => {
+            let target = eval(scope, target, out)?;
             let index = eval(scope, index, out)?;
             let value = eval(scope, value, out)?;
-            scope
-                .borrow_mut()
-                .modify(name, |target| store_element(target, &index, value))
-                .ok_or_else(|| RuntimeError::UndefinedVariable(name.clone()))??;
+            store_element(&target, &index, value)?;
         }
         Statement::Print(expression) => {
             let value = eval(scope, expression, out)?;
@@ -317,21 +337,36 @@ fn eval(
             .iter()
             .map(|item| eval(scope, item, out))
             .collect::<Result<_, _>>()
-            .map(Value::Array),
-        Expression::Index { target, index } => match target.as_ref() {
-            Expression::Ident(name) => {
-                let index = eval(scope, index, out)?;
-                scope
-                    .borrow()
-                    .read(name, |value| element(value, &index))
-                    .ok_or_else(|| RuntimeError::UndefinedVariable(name.clone()))?
-            }
-            target => {
-                let target = eval(scope, target, out)?;
-                let index = eval(scope, index, out)?;
-                element(&target, &index)
-            }
+            .map(Value::new_array),
+        Expression::Negate(operand) => match eval(scope, operand, out)? {
+            Value::Int(value) => value
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or(RuntimeError::Overflow),
+            other => Err(RuntimeError::InvalidNegation(other.type_name())),
         },
+        Expression::Index { target, index } => {
+            let target = eval(scope, target, out)?;
+            let index = eval(scope, index, out)?;
+            element(&target, &index)
+        }
+        Expression::Slice { target, start, end } => {
+            let target = eval(scope, target, out)?;
+            let start = start
+                .as_ref()
+                .map(|bound| eval(scope, bound, out))
+                .transpose()?;
+            let end = end
+                .as_ref()
+                .map(|bound| eval(scope, bound, out))
+                .transpose()?;
+            slice(&target, start.as_ref(), end.as_ref())
+        }
+        Expression::MethodCall {
+            target,
+            method,
+            arguments,
+        } => call_method(scope, target, method, arguments, out),
         Expression::Ident(name) => scope
             .borrow()
             .get(name)
@@ -419,53 +454,143 @@ fn apply(op: BinaryOp, left: Value, right: Value) -> Result<Value, RuntimeError>
     }
 }
 
+fn call_method(
+    scope: &Scope,
+    target: &Expression,
+    method: &str,
+    arguments: &[Expression],
+    out: &mut impl Write,
+) -> Result<Value, RuntimeError> {
+    let receiver = eval(scope, target, out)?;
+    match (&receiver, method) {
+        (Value::Array(items), "len") => {
+            expect_arguments(method, arguments, 0)?;
+            Ok(length_value(items.borrow().len()))
+        }
+        (Value::Array(items), "pop") => {
+            expect_arguments(method, arguments, 0)?;
+            items.borrow_mut().pop().ok_or(RuntimeError::PopFromEmpty)
+        }
+        (Value::Array(items), "push") => {
+            expect_arguments(method, arguments, 1)?;
+            let value = eval(scope, &arguments[0], out)?;
+            items.borrow_mut().push(value);
+            Ok(Value::Unit)
+        }
+        (Value::String(text), "len") => {
+            expect_arguments(method, arguments, 0)?;
+            Ok(length_value(text.chars().count()))
+        }
+        _ => Err(RuntimeError::UnknownMethod {
+            receiver: receiver.type_name(),
+            method: method.to_owned(),
+        }),
+    }
+}
+
+fn expect_arguments(
+    method: &str,
+    arguments: &[Expression],
+    expected: usize,
+) -> Result<(), RuntimeError> {
+    if arguments.len() == expected {
+        return Ok(());
+    }
+    Err(RuntimeError::ArityMismatch {
+        name: method.to_owned(),
+        expected,
+        found: arguments.len(),
+    })
+}
+
+fn length_value(length: usize) -> Value {
+    Value::Int(i64::try_from(length).unwrap_or(i64::MAX))
+}
+
 fn element(value: &Value, index: &Value) -> Result<Value, RuntimeError> {
     match value {
         Value::Array(items) => {
-            let index = integer_index(index)?;
-            usize::try_from(index)
-                .ok()
-                .and_then(|position| items.get(position))
-                .cloned()
-                .ok_or(RuntimeError::IndexOutOfRange {
-                    index,
-                    length: items.len(),
-                })
+            let items = items.borrow();
+            let position = resolve_index(index, items.len())?;
+            Ok(items[position].clone())
         }
         Value::String(text) => {
-            let index = integer_index(index)?;
-            usize::try_from(index)
-                .ok()
-                .and_then(|position| text.chars().nth(position))
-                .map(|character| Value::String(character.to_string()))
-                .ok_or_else(|| RuntimeError::IndexOutOfRange {
-                    index,
-                    length: text.chars().count(),
-                })
+            let position = resolve_index(index, text.chars().count())?;
+            Ok(Value::String(text.chars().skip(position).take(1).collect()))
         }
         other => Err(RuntimeError::NotIndexable(other.type_name())),
     }
 }
 
-fn store_element(target: &mut Value, index: &Value, value: Value) -> Result<(), RuntimeError> {
+fn store_element(target: &Value, index: &Value, value: Value) -> Result<(), RuntimeError> {
     let Value::Array(items) = target else {
         return Err(RuntimeError::ElementAssignment(target.type_name()));
     };
-    let index = integer_index(index)?;
-    let length = items.len();
-    let slot = usize::try_from(index)
-        .ok()
-        .and_then(|position| items.get_mut(position))
-        .ok_or(RuntimeError::IndexOutOfRange { index, length })?;
-    *slot = value;
+    let mut items = items.borrow_mut();
+    let position = resolve_index(index, items.len())?;
+    items[position] = value;
     Ok(())
 }
 
-fn integer_index(index: &Value) -> Result<i64, RuntimeError> {
-    match index {
-        Value::Int(index) => Ok(*index),
-        other => Err(RuntimeError::NonIntegerIndex(other.type_name())),
+fn slice(value: &Value, start: Option<&Value>, end: Option<&Value>) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Array(items) => {
+            let items = items.borrow();
+            let window = slice_window(start, end, items.len())?;
+            Ok(Value::new_array(items[window].to_vec()))
+        }
+        Value::String(text) => {
+            let window = slice_window(start, end, text.chars().count())?;
+            let window_length = window.end - window.start;
+            let sliced = text.chars().skip(window.start).take(window_length);
+            Ok(Value::String(sliced.collect()))
+        }
+        other => Err(RuntimeError::NotIndexable(other.type_name())),
     }
+}
+
+fn resolve_index(index: &Value, length: usize) -> Result<usize, RuntimeError> {
+    let Value::Int(index) = *index else {
+        return Err(RuntimeError::NonIntegerIndex(index.type_name()));
+    };
+    let position = match usize::try_from(index) {
+        Ok(forward) => Some(forward),
+        Err(_) => usize::try_from(index.unsigned_abs())
+            .ok()
+            .and_then(|back| length.checked_sub(back)),
+    };
+    position
+        .filter(|&position| position < length)
+        .ok_or(RuntimeError::IndexOutOfRange { index, length })
+}
+
+fn slice_window(
+    start: Option<&Value>,
+    end: Option<&Value>,
+    length: usize,
+) -> Result<Range<usize>, RuntimeError> {
+    let start = clamp_bound(start, 0, length)?;
+    let end = clamp_bound(end, length, length)?;
+    Ok(start..end.max(start))
+}
+
+fn clamp_bound(
+    bound: Option<&Value>,
+    default: usize,
+    length: usize,
+) -> Result<usize, RuntimeError> {
+    let Some(bound) = bound else {
+        return Ok(default);
+    };
+    let Value::Int(bound) = *bound else {
+        return Err(RuntimeError::NonIntegerIndex(bound.type_name()));
+    };
+    Ok(match usize::try_from(bound) {
+        Ok(forward) => forward.min(length),
+        Err(_) => {
+            usize::try_from(bound.unsigned_abs()).map_or(0, |back| length.saturating_sub(back))
+        }
+    })
 }
 
 fn apply_int(op: BinaryOp, left: i64, right: i64) -> Result<Value, RuntimeError> {
@@ -756,18 +881,110 @@ mod tests {
     }
 
     #[test]
-    fn index_assignment_evaluates_index_before_value() {
+    fn index_assignment_evaluates_target_then_index_then_value() {
         let script = "def show(n):\nprint(n)\nreturn n\nend\n\
-                      xs = [1]\nxs[show(0)] = show(7)\nprint(xs)";
-        assert_eq!(output_of(script), "0\n7\n[7]\n");
+                      def pick(xs):\nprint(100)\nreturn xs\nend\n\
+                      xs = [1]\npick(xs)[show(0)] = show(7)\nprint(xs)";
+        assert_eq!(output_of(script), "100\n0\n7\n[7]\n");
     }
 
     #[test]
-    fn arrays_have_value_semantics() {
-        let script = "a = [1, 2]\nb = a\nb[0] = 9\nprint(a)\nprint(b)\n\
-                      def clobber(xs):\nxs[0] = 99\nreturn xs\nend\n\
-                      c = clobber(a)\nprint(a)\nprint(c)";
-        assert_eq!(output_of(script), "[1, 2]\n[9, 2]\n[1, 2]\n[99, 2]\n");
+    fn assigning_an_array_shares_the_same_heap_vector() {
+        assert_eq!(
+            output_of("a = [1, 2] \n b = a \n b[0] = 99 \n print(a[0])"),
+            "99\n"
+        );
+    }
+
+    #[test]
+    fn functions_receive_and_return_arrays_by_reference() {
+        let script = "def add_one(xs):\nxs.push(1)\nreturn xs\nend\n\
+                      a = []\nb = add_one(a)\nadd_one(a)\nb[0] = 7\nprint(a)\nprint(b)";
+        assert_eq!(output_of(script), "[7, 1]\n[7, 1]\n");
+    }
+
+    #[test]
+    fn strings_stay_immutable_values() {
+        let script = "s = \"ab\"\nt = s\nt = t + \"c\"\nprint(s)\nprint(t)";
+        assert_eq!(output_of(script), "ab\nabc\n");
+    }
+
+    #[test]
+    fn nested_index_assignment_mutates_the_base_vector_in_place() {
+        let script = "m = [[1, 2], [3, 4]]\nm[0][1] = 99\nprint(m)\nm[1][-1] = 7\nprint(m[1])\n\
+                      row = m[0]\nrow[0] = 5\nprint(m)\nt = [[[0]]]\nt[0][0][0] = 1\nprint(t)";
+        assert_eq!(
+            output_of(script),
+            "[[1, 99], [3, 4]]\n[3, 7]\n[[5, 99], [3, 7]]\n[[[1]]]\n"
+        );
+    }
+
+    #[test]
+    fn negative_indexes_count_from_the_end() {
+        let script = "xs = [10, 20, 30]\nprint(xs[-1])\nprint(xs[-3])\nxs[-1] = 0\nprint(xs)\n\
+                      s = \"h\u{e9}llo\"\nprint(s[-1])\nprint(s[-4])";
+        assert_eq!(output_of(script), "30\n10\n[10, 20, 0]\no\n\u{e9}\n");
+    }
+
+    #[test]
+    fn slices_cap_at_the_boundaries_and_support_negative_bounds() {
+        let script = "arr = [10, 20, 30, 40] \n print(arr[-2:4])\n\
+                      xs = [1, 2, 3, 4, 5]\nprint(xs[1:3])\nprint(xs[:2])\nprint(xs[3:])\n\
+                      print(xs[:])\nprint(xs[-2:])\nprint(xs[1:100])\nprint(xs[-100:2])\n\
+                      print(xs[4:1])\nprint(xs[10:20])\n\
+                      s = \"h\u{e9}llo w\u{f6}rld\"\nprint(s[0:2])\nprint(s[6:])\nprint(s[-3:])\nprint(\"abc\"[1:1])";
+        assert_eq!(
+            output_of(script),
+            "[30, 40]\n[2, 3]\n[1, 2]\n[4, 5]\n[1, 2, 3, 4, 5]\n[4, 5]\n[2, 3, 4, 5]\n[1, 2]\n[]\n[]\n\
+             h\u{e9}\nw\u{f6}rld\nrld\n\n"
+        );
+    }
+
+    #[test]
+    fn slices_are_independent_but_shallow_copies() {
+        let script = "xs = [1, 2, 3]\nys = xs[0:2]\nys[0] = 99\nprint(xs)\nprint(ys)\n\
+                      zs = xs[:]\nzs.push(4)\nprint(xs)\nprint(zs)\n\
+                      m = [[1], [2]]\nc = m[:]\nc[0][0] = 9\nprint(m)";
+        assert_eq!(
+            output_of(script),
+            "[1, 2, 3]\n[99, 2]\n[1, 2, 3]\n[1, 2, 3, 4]\n[[9], [2]]\n"
+        );
+    }
+
+    #[test]
+    fn push_appends_in_place_and_len_counts_characters() {
+        let script = "arr = [10]\narr.push(50)\nprint(arr)\nprint(arr.len())\n\
+                      print([1, 2, 3].len())\nprint([].len())\nprint(\"h\u{e9}llo\".len())";
+        assert_eq!(output_of(script), "[10, 50]\n2\n3\n0\n5\n");
+    }
+
+    #[test]
+    fn push_and_pop_return_values_and_share_pushed_arrays() {
+        let script = "xs = []\nprint(xs.push(1))\nxs.push(\"a\")\nprint(xs)\nprint(xs.pop())\nprint(xs)\n\
+                      inner = [1]\nouter = []\nouter.push(inner)\ninner.push(2)\nprint(outer)";
+        assert_eq!(output_of(script), "unit\n[1, \"a\"]\na\n[1]\n[[1, 2]]\n");
+    }
+
+    #[test]
+    fn loops_can_grow_and_walk_arrays_with_len() {
+        let script = "xs = []\ni = 0\nwhile i < 5:\nxs.push(i * i)\ni = i + 1\nend\n\
+                      total = 0\nj = 0\nwhile j < xs.len():\ntotal = total + xs[j]\nj = j + 1\nend\n\
+                      print(xs)\nprint(total)";
+        assert_eq!(output_of(script), "[0, 1, 4, 9, 16]\n30\n");
+    }
+
+    #[test]
+    fn unary_minus_negates_integers() {
+        let script = "print(-5)\nprint(2 - -3)\nprint(-2 * 3)\nprint(-(1 + 2))\n\
+                      xs = [4, 5]\nprint(-xs[1])\nprint(--3)";
+        assert_eq!(output_of(script), "-5\n5\n-6\n-3\n-5\n3\n");
+    }
+
+    #[test]
+    fn self_referencing_arrays_print_without_recursing_forever() {
+        let script = "a = [1]\na.push(a)\nprint(a)\nb = [0]\nb[0] = b\nprint(b)\n\
+                      c = []\nd = [c]\nc.push(d)\nprint(c)";
+        assert_eq!(output_of(script), "[1, [...]]\n[[...]]\n[[[...]]]\n");
     }
 
     #[test]
@@ -811,7 +1028,7 @@ mod tests {
         assert!(run(&globals, "xs = [1, 2]\nxs[5] = 0").is_err());
         assert_eq!(
             globals.borrow().get("xs"),
-            Some(Value::Array(vec![Value::Int(1), Value::Int(2)]))
+            Some(Value::new_array(vec![Value::Int(1), Value::Int(2)]))
         );
     }
 
@@ -854,11 +1071,51 @@ mod tests {
                 "xs = [1, 2, 3]\nprint(xs[3])",
                 "index 3 out of range for length 3",
             ),
-            (
-                "xs = [1]\nprint(xs[0 - 1])",
-                "index -1 out of range for length 1",
-            ),
             ("xs = []\nprint(xs[0])", "index 0 out of range for length 0"),
+            (
+                "xs = [1, 2, 3]\nprint(xs[-4])",
+                "index -4 out of range for length 3",
+            ),
+            ("print(\"abc\"[-4])", "index -4 out of range for length 3"),
+            ("print([][-1])", "index -1 out of range for length 0"),
+            ("xs = [1]\nxs[-2] = 0", "index -2 out of range for length 1"),
+            (
+                "xs = [1]\nprint(xs[0:true])",
+                "index must be an integer, found boolean",
+            ),
+            (
+                "xs = [1]\nprint(xs[\"a\":])",
+                "index must be an integer, found string",
+            ),
+            ("print(5[0:1])", "cannot index integer"),
+            ("print(-true)", "cannot negate boolean"),
+            ("print(-\"a\")", "cannot negate string"),
+            ("print(-(0 - 9223372036854775807 - 1))", "integer overflow"),
+            ("print([1].nope())", "array has no method `nope`"),
+            ("print(\"a\".push(1))", "string has no method `push`"),
+            ("print(5.len())", "integer has no method `len`"),
+            (
+                "xs = [1]\nxs.push()",
+                "wrong number of arguments to `push`: expected 1, found 0",
+            ),
+            (
+                "xs = [1]\nxs.len(1)",
+                "wrong number of arguments to `len`: expected 0, found 1",
+            ),
+            ("xs = []\nxs.pop()", "pop from empty array"),
+            (
+                "m = [[1]]\nm[0][1] = 2",
+                "index 1 out of range for length 1",
+            ),
+            (
+                "m = [1]\nm[0][0] = 2",
+                "cannot assign to an element of integer",
+            ),
+            ("nope.push(1)", "undefined variable `nope`"),
+            (
+                "xs = [1]\nxs[1:2] = [3]",
+                "line 2: expected end of statement, found `=`",
+            ),
             ("print(\"abc\"[3])", "index 3 out of range for length 3"),
             (
                 "print(\"h\u{e9}llo\"[5])",

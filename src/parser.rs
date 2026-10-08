@@ -63,20 +63,23 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let statement = match self.current_token {
-            Token::Ident(_) if self.peek_token == Token::LParen => {
-                Statement::Expression(self.parse_expression(LOWEST_BINDING)?)
-            }
-            Token::Ident(name) if self.peek_token == Token::LBracket => {
-                self.advance();
-                self.advance();
-                let index = self.parse_expression(LOWEST_BINDING)?;
-                self.expect_peek(Token::RBracket)?;
-                self.expect_peek(Token::Assign)?;
-                self.advance();
-                Statement::IndexAssign {
-                    name: name.to_owned(),
-                    index,
-                    value: self.parse_expression(LOWEST_BINDING)?,
+            Token::Ident(_)
+                if matches!(
+                    self.peek_token,
+                    Token::LParen | Token::LBracket | Token::Dot
+                ) =>
+            {
+                match self.parse_expression(LOWEST_BINDING)? {
+                    Expression::Index { target, index } if self.peek_token == Token::Assign => {
+                        self.advance();
+                        self.advance();
+                        Statement::IndexAssign {
+                            target: *target,
+                            index: *index,
+                            value: self.parse_expression(LOWEST_BINDING)?,
+                        }
+                    }
+                    expression => Statement::Expression(expression),
                 }
             }
             Token::Ident(name) => {
@@ -149,7 +152,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expression(&mut self, min_binding: u8) -> Result<Expression, ParseError> {
-        let mut left = self.parse_postfix()?;
+        let mut left = self.parse_unary()?;
         while let Some((op, binding)) = infix_binding(self.peek_token)
             && binding >= min_binding
         {
@@ -165,19 +168,74 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    fn parse_unary(&mut self) -> Result<Expression, ParseError> {
+        if self.current_token != Token::Minus {
+            return self.parse_postfix();
+        }
+        self.advance();
+        Ok(Expression::Negate(Box::new(self.parse_unary()?)))
+    }
+
     fn parse_postfix(&mut self) -> Result<Expression, ParseError> {
         let mut target = self.parse_primary()?;
-        while self.peek_token == Token::LBracket {
-            self.advance();
-            self.advance();
-            let index = self.parse_expression(LOWEST_BINDING)?;
-            self.expect_peek(Token::RBracket)?;
-            target = Expression::Index {
-                target: Box::new(target),
-                index: Box::new(index),
+        loop {
+            target = match self.peek_token {
+                Token::LBracket => self.parse_subscript(target)?,
+                Token::Dot => self.parse_method_call(target)?,
+                _ => return Ok(target),
             };
         }
-        Ok(target)
+    }
+
+    fn parse_subscript(&mut self, target: Expression) -> Result<Expression, ParseError> {
+        self.advance();
+        let start = if self.peek_token == Token::Colon {
+            None
+        } else {
+            self.advance();
+            Some(self.parse_expression(LOWEST_BINDING)?)
+        };
+        let target = Box::new(target);
+        match start {
+            Some(index) if self.peek_token != Token::Colon => {
+                self.expect_peek(Token::RBracket)?;
+                Ok(Expression::Index {
+                    target,
+                    index: Box::new(index),
+                })
+            }
+            start => {
+                self.expect_peek(Token::Colon)?;
+                let end = if self.peek_token == Token::RBracket {
+                    None
+                } else {
+                    self.advance();
+                    Some(Box::new(self.parse_expression(LOWEST_BINDING)?))
+                };
+                self.expect_peek(Token::RBracket)?;
+                Ok(Expression::Slice {
+                    target,
+                    start: start.map(Box::new),
+                    end,
+                })
+            }
+        }
+    }
+
+    fn parse_method_call(&mut self, target: Expression) -> Result<Expression, ParseError> {
+        self.advance();
+        let method = self.expect_ident("method name")?;
+        self.expect_peek(Token::LParen)?;
+        let arguments = self.parse_list(Token::RParen, Self::parse_full_expression)?;
+        Ok(Expression::MethodCall {
+            target: Box::new(target),
+            method,
+            arguments,
+        })
+    }
+
+    fn parse_full_expression(&mut self) -> Result<Expression, ParseError> {
+        self.parse_expression(LOWEST_BINDING)
     }
 
     fn parse_primary(&mut self) -> Result<Expression, ParseError> {
@@ -187,16 +245,12 @@ impl<'a> Parser<'a> {
             Token::False => Ok(Expression::Bool(false)),
             Token::String(text) => Ok(Expression::String(text.to_owned())),
             Token::LBracket => {
-                let items = self.parse_list(Token::RBracket, |parser| {
-                    parser.parse_expression(LOWEST_BINDING)
-                })?;
+                let items = self.parse_list(Token::RBracket, Self::parse_full_expression)?;
                 Ok(Expression::Array(items))
             }
             Token::Ident(name) if self.peek_token == Token::LParen => {
                 self.advance();
-                let arguments = self.parse_list(Token::RParen, |parser| {
-                    parser.parse_expression(LOWEST_BINDING)
-                })?;
+                let arguments = self.parse_list(Token::RParen, Self::parse_full_expression)?;
                 Ok(Expression::Call {
                     name: name.to_owned(),
                     arguments,
@@ -655,10 +709,111 @@ mod tests {
         assert_eq!(
             parse("xs[i + 1] = 2 * 3").unwrap(),
             [Statement::IndexAssign {
-                name: "xs".to_owned(),
+                target: ident("xs"),
                 index: binary(BinaryOp::Add, ident("i"), Expression::Int(1)),
                 value: binary(BinaryOp::Multiply, Expression::Int(2), Expression::Int(3)),
             }]
+        );
+    }
+
+    #[test]
+    fn parses_multi_dimensional_index_assignment() {
+        assert_eq!(
+            parse("m[0][1] = 99").unwrap(),
+            [Statement::IndexAssign {
+                target: index(ident("m"), Expression::Int(0)),
+                index: Expression::Int(1),
+                value: Expression::Int(99),
+            }]
+        );
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_binary_operators() {
+        assert_eq!(
+            parse("x = -5 * -y\nz = 2 - -3\nw = -xs[0]").unwrap(),
+            [
+                assign(
+                    "x",
+                    binary(
+                        BinaryOp::Multiply,
+                        Expression::Negate(Box::new(Expression::Int(5))),
+                        Expression::Negate(Box::new(ident("y"))),
+                    ),
+                ),
+                assign(
+                    "z",
+                    binary(
+                        BinaryOp::Subtract,
+                        Expression::Int(2),
+                        Expression::Negate(Box::new(Expression::Int(3))),
+                    ),
+                ),
+                assign(
+                    "w",
+                    Expression::Negate(Box::new(index(ident("xs"), Expression::Int(0)))),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_slices_with_optional_and_negative_bounds() {
+        let slice = |start: Option<Expression>, end: Option<Expression>| Expression::Slice {
+            target: Box::new(ident("xs")),
+            start: start.map(Box::new),
+            end: end.map(Box::new),
+        };
+        assert_eq!(
+            parse("a = xs[1:3]\nb = xs[:2]\nc = xs[1:]\nd = xs[:]\ne = xs[-2:4]").unwrap(),
+            [
+                assign(
+                    "a",
+                    slice(Some(Expression::Int(1)), Some(Expression::Int(3)))
+                ),
+                assign("b", slice(None, Some(Expression::Int(2)))),
+                assign("c", slice(Some(Expression::Int(1)), None)),
+                assign("d", slice(None, None)),
+                assign(
+                    "e",
+                    slice(
+                        Some(Expression::Negate(Box::new(Expression::Int(2)))),
+                        Some(Expression::Int(4)),
+                    ),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_chained_method_calls_as_expressions_and_statements() {
+        let method =
+            |target: Expression, name: &str, arguments: Vec<Expression>| Expression::MethodCall {
+                target: Box::new(target),
+                method: name.to_owned(),
+                arguments,
+            };
+        assert_eq!(
+            parse("n = xs.push(1 + 2).len()\nxs.push(3)").unwrap(),
+            [
+                assign(
+                    "n",
+                    method(
+                        method(
+                            ident("xs"),
+                            "push",
+                            vec![binary(
+                                BinaryOp::Add,
+                                Expression::Int(1),
+                                Expression::Int(2)
+                            )],
+                        ),
+                        "len",
+                        vec![],
+                    ),
+                ),
+                Statement::Expression(method(ident("xs"), "push", vec![Expression::Int(3)])),
+            ]
         );
     }
 
@@ -727,9 +882,22 @@ mod tests {
             ("f(1, 2]", "line 1: expected `)`, found `]`"),
             ("x = xs[]", "line 1: expected expression, found `]`"),
             ("x = xs[1", "line 1: expected `]`, found end of input"),
-            ("xs[0]", "line 1: expected `=`, found end of input"),
             ("xs[0] =", "line 1: expected expression, found end of input"),
-            ("xs[0][1] = 2", "line 1: expected `=`, found `[`"),
+            ("xs.", "line 1: expected method name, found end of input"),
+            ("xs.5()", "line 1: expected method name, found integer `5`"),
+            ("xs.len", "line 1: expected `(`, found end of input"),
+            ("xs.push(1", "line 1: expected `)`, found end of input"),
+            (
+                "x = xs[1:",
+                "line 1: expected expression, found end of input",
+            ),
+            ("x = xs[1:2", "line 1: expected `]`, found end of input"),
+            ("x = xs[1:2:3]", "line 1: expected `]`, found `:`"),
+            ("x = -", "line 1: expected expression, found end of input"),
+            (
+                "xs[1:2] = 3",
+                "line 1: expected end of statement, found `=`",
+            ),
             ("[1, 2][0] = 3", "line 1: expected statement, found `[`"),
             (
                 "xs[0] = 1 2",

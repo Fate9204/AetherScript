@@ -64,6 +64,7 @@ impl<'a> Lexer<'a> {
             b'<' => Token::Lt,
             b':' => Token::Colon,
             b',' => Token::Comma,
+            b'.' => Token::Dot,
             b'(' => Token::LParen,
             b')' => Token::RParen,
             b'[' => Token::LBracket,
@@ -276,6 +277,27 @@ mod tests {
                 Token::RBracket,
                 Token::LBracket,
                 Token::Int(0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_method_call_dot_and_slice_colon() {
+        assert_eq!(
+            tokenize("xs.len()[-1:2]"),
+            [
+                Token::Ident("xs"),
+                Token::Dot,
+                Token::Ident("len"),
+                Token::LParen,
+                Token::RParen,
+                Token::LBracket,
+                Token::Minus,
+                Token::Int(1),
+                Token::Colon,
+                Token::Int(2),
                 Token::RBracket,
                 Token::Eof,
             ]
