@@ -1,19 +1,23 @@
 use std::env;
 use std::error::Error;
+use std::ffi::OsStr;
+use std::fmt::Display;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::panic;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::thread;
 
 use aetherscript::compiler::Compiler;
 use aetherscript::evaluator::{Environment, Scope, execute};
+use aetherscript::highlight;
 use aetherscript::lexer::Lexer;
 use aetherscript::parser::Parser;
 use aetherscript::token::Token;
 use aetherscript::vm::VirtualMachine;
 
 const INTERPRETER_STACK_BYTES: usize = 256 * 1024 * 1024;
+const REDRAW_COLUMNS: usize = 80;
 
 enum Engine {
     TreeWalker(Scope),
@@ -34,6 +38,61 @@ impl Engine {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Presentation {
+    color_errors: bool,
+    redraw_input: bool,
+}
+
+impl Presentation {
+    const PLAIN: Self = Self {
+        color_errors: false,
+        redraw_input: false,
+    };
+
+    fn detect(arguments: &[String]) -> Self {
+        let no_color = env::var_os("NO_COLOR");
+        if !color_allowed(arguments, no_color.as_deref()) {
+            return Self::PLAIN;
+        }
+        let on_console = io::stderr().is_terminal() || io::stdout().is_terminal();
+        if cfg!(windows) && on_console {
+            enable_ansi_escapes();
+        }
+        Self {
+            color_errors: io::stderr().is_terminal(),
+            // Unix ttys echo on arrival; redrawing would misplace pasted lines.
+            redraw_input: cfg!(windows) && io::stdin().is_terminal() && io::stdout().is_terminal(),
+        }
+    }
+
+    fn diagnostic(self, error: &impl Display) -> String {
+        let text = format!("error: {error}");
+        if self.color_errors {
+            highlight::error(&text)
+        } else {
+            text
+        }
+    }
+
+    fn redraw(self, prompt: &str, line: &str) -> Option<String> {
+        let text = line.strip_suffix('\n')?.trim_end_matches('\r');
+        let fits = prompt.len() + text.len() < REDRAW_COLUMNS;
+        let plain = text.bytes().all(|byte| matches!(byte, b' '..=b'~'));
+        (self.redraw_input && fits && plain).then(|| highlight::echo(prompt, text))
+    }
+}
+
+fn color_allowed(arguments: &[String], no_color: Option<&OsStr>) -> bool {
+    let disabled_by_environment = no_color.is_some_and(|value| !value.is_empty());
+    !disabled_by_environment && !arguments.iter().any(|argument| argument == "--no-color")
+}
+
+fn enable_ansi_escapes() {
+    // Starting cmd switches the console into escape-sequence mode.
+    let _ = Command::new("cmd").args(["/C", ""]).status();
+}
+
 fn select_engine(arguments: &[String]) -> Engine {
     if arguments.iter().any(|argument| argument == "--tree") {
         Engine::TreeWalker(Environment::global())
@@ -51,9 +110,10 @@ fn script_path(arguments: &[String]) -> Option<&str> {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
+    let presentation = Presentation::detect(&arguments);
     let session = thread::Builder::new()
         .stack_size(INTERPRETER_STACK_BYTES)
-        .spawn(move || launch(&arguments).map_err(|error| error.to_string()));
+        .spawn(move || launch(&arguments, presentation).map_err(|error| error.to_string()));
     let outcome = match session {
         Ok(handle) => handle
             .join()
@@ -63,13 +123,13 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("error: {message}");
+            eprintln!("{}", presentation.diagnostic(&message));
             ExitCode::FAILURE
         }
     }
 }
 
-fn launch(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+fn launch(arguments: &[String], presentation: Presentation) -> Result<(), Box<dyn Error>> {
     let engine = select_engine(arguments);
     match script_path(arguments) {
         Some(path) => run_script(path, engine, &mut io::stdout().lock()),
@@ -78,6 +138,7 @@ fn launch(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             io::stdout(),
             io::stderr(),
             engine,
+            presentation,
         )?),
     }
 }
@@ -93,6 +154,7 @@ fn repl(
     mut out: impl Write,
     mut errors: impl Write,
     mut engine: Engine,
+    presentation: Presentation,
 ) -> io::Result<()> {
     let mut source = String::new();
     let mut open_blocks = 0;
@@ -105,25 +167,32 @@ fn repl(
         let mut raw_line = Vec::new();
         if input.read_until(b'\n', &mut raw_line)? == 0 {
             if !source.is_empty() {
-                report(engine.run(&source, &mut out), &mut errors)?;
+                report(engine.run(&source, &mut out), &mut errors, presentation)?;
             }
             return writeln!(out);
         }
         let line = String::from_utf8_lossy(&raw_line);
+        if let Some(redrawn) = presentation.redraw(prompt, &line) {
+            out.write_all(redrawn.as_bytes())?;
+        }
         open_blocks = (open_blocks + block_delta(&line)).max(0);
         source.push_str(&line);
         if open_blocks > 0 {
             continue;
         }
-        report(engine.run(&source, &mut out), &mut errors)?;
+        report(engine.run(&source, &mut out), &mut errors, presentation)?;
         source.clear();
     }
 }
 
-fn report(result: Result<(), Box<dyn Error>>, errors: &mut impl Write) -> io::Result<()> {
+fn report(
+    result: Result<(), Box<dyn Error>>,
+    errors: &mut impl Write,
+    presentation: Presentation,
+) -> io::Result<()> {
     match result {
         Ok(()) => Ok(()),
-        Err(error) => writeln!(errors, "error: {error}"),
+        Err(error) => writeln!(errors, "{}", presentation.diagnostic(&error)),
     }
 }
 
@@ -158,8 +227,16 @@ mod tests {
     }
 
     fn session_with(input: &[u8], engine: Engine) -> (String, String) {
+        styled_session(input, engine, Presentation::PLAIN)
+    }
+
+    fn styled_session(
+        input: &[u8],
+        engine: Engine,
+        presentation: Presentation,
+    ) -> (String, String) {
         let (mut out, mut errors) = (Vec::new(), Vec::new());
-        repl(input, &mut out, &mut errors, engine).unwrap();
+        repl(input, &mut out, &mut errors, engine, presentation).unwrap();
         (
             String::from_utf8(out).unwrap(),
             String::from_utf8(errors).unwrap(),
@@ -324,5 +401,82 @@ mod tests {
             error.starts_with("cannot read does-not-exist.ae: "),
             "{error}"
         );
+    }
+
+    const REDRAWING: Presentation = Presentation {
+        color_errors: false,
+        redraw_input: true,
+    };
+
+    #[test]
+    fn a_redrawing_session_repaints_each_echoed_line_in_colour() {
+        let (out, errors) = styled_session(
+            b"x = 5\nprint(x)\n",
+            Engine::Bytecode(VirtualMachine::default()),
+            REDRAWING,
+        );
+        let repaint = "\x1b[1A\r\x1b[2K";
+        assert_eq!(
+            out,
+            format!(
+                ">> {repaint}>> \x1b[33mx\x1b[0m = \x1b[36m5\x1b[0m\n\
+                 >> {repaint}>> \x1b[35mprint\x1b[0m(\x1b[33mx\x1b[0m)\n5\n>> \n"
+            )
+        );
+        assert_eq!(errors, "");
+    }
+
+    #[test]
+    fn lines_that_cannot_be_repainted_in_place_are_left_as_typed() {
+        let long_comment = format!("# {}\n", "a".repeat(REDRAW_COLUMNS));
+        let input = [
+            b"# \xc3\xa9\n".as_slice(),
+            long_comment.as_bytes(),
+            b"x = 1",
+        ]
+        .concat();
+        let (out, errors) = styled_session(
+            &input,
+            Engine::Bytecode(VirtualMachine::default()),
+            REDRAWING,
+        );
+        assert_eq!(out, ">> >> >> >> \n");
+        assert_eq!(errors, "");
+    }
+
+    #[test]
+    fn a_windows_line_ending_is_repainted_without_its_carriage_return() {
+        let (out, _) = styled_session(
+            b"7\r\n",
+            Engine::Bytecode(VirtualMachine::default()),
+            REDRAWING,
+        );
+        assert_eq!(out, ">> \x1b[1A\r\x1b[2K>> \x1b[36m7\x1b[0m\n>> \n");
+    }
+
+    #[test]
+    fn coloured_diagnostics_are_bold_red_and_plain_ones_are_untouched() {
+        let coloured = Presentation {
+            color_errors: true,
+            redraw_input: false,
+        };
+        let (out, errors) = styled_session(
+            b"print(y)\n",
+            Engine::TreeWalker(Environment::global()),
+            coloured,
+        );
+        assert_eq!(out, ">> >> \n");
+        assert_eq!(errors, "\x1b[31;1merror: undefined variable `y`\x1b[0m\n");
+        assert_eq!(Presentation::PLAIN.diagnostic(&"boom"), "error: boom");
+        assert_eq!(coloured.diagnostic(&"boom"), "\x1b[31;1merror: boom\x1b[0m");
+    }
+
+    #[test]
+    fn colour_is_disabled_by_the_flag_and_by_a_non_empty_no_color_variable() {
+        assert!(color_allowed(&[], None));
+        assert!(color_allowed(&[], Some(OsStr::new(""))));
+        assert!(!color_allowed(&[], Some(OsStr::new("1"))));
+        assert!(!color_allowed(&arguments(&["--no-color"]), None));
+        assert!(!color_allowed(&arguments(&["a.ae", "--no-color"]), None));
     }
 }

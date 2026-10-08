@@ -19,6 +19,10 @@ impl<'a> Lexer<'a> {
         self.line
     }
 
+    pub fn offset(&self) -> usize {
+        self.pos
+    }
+
     pub fn next_token(&mut self) -> Token<'a> {
         self.skip_blanks_and_comment();
 
