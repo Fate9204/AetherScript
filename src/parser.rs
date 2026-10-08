@@ -870,6 +870,10 @@ mod tests {
             ),
             ("if x:\nelse\nend", "line 2: expected `:`, found newline"),
             (
+                "if x:\nelse: print(1)\nend",
+                "line 2: expected newline, found `print`",
+            ),
+            (
                 "if x:\nelse:\nelse:\nend",
                 "line 3: expected statement, found `else`",
             ),
@@ -1293,6 +1297,47 @@ mod tests {
         assert_eq!(
             parse("x = 1\r\n\r\ny = )").unwrap_err().to_string(),
             "line 3: expected expression, found `)`"
+        );
+    }
+
+    #[test]
+    fn each_new_comparison_sits_at_its_siblings_level_next_to_every_neighbour() {
+        assert_eq!(
+            parse("x = a == b <= c").unwrap(),
+            [assign(
+                "x",
+                binary(
+                    BinaryOp::Equal,
+                    ident("a"),
+                    binary(BinaryOp::LessEqual, ident("b"), ident("c")),
+                )
+            )]
+        );
+        assert_eq!(
+            parse("x = a != b == c").unwrap(),
+            [assign(
+                "x",
+                binary(
+                    BinaryOp::Equal,
+                    binary(BinaryOp::NotEqual, ident("a"), ident("b")),
+                    ident("c"),
+                )
+            )]
+        );
+        assert_eq!(
+            parse("x = a >= b + c * d").unwrap(),
+            [assign(
+                "x",
+                binary(
+                    BinaryOp::GreaterEqual,
+                    ident("a"),
+                    binary(
+                        BinaryOp::Add,
+                        ident("b"),
+                        binary(BinaryOp::Multiply, ident("c"), ident("d")),
+                    ),
+                )
+            )]
         );
     }
 }

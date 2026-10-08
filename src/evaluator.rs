@@ -1338,12 +1338,10 @@ mod tests {
 
     #[test]
     fn an_error_inside_a_branch_keeps_the_output_before_it() {
-        let globals = Environment::global();
-        let result = run(
-            &globals,
-            "print(1)\nif true:\nprint(2)\nprint(y)\nend\nprint(3)",
-        );
-        assert_eq!(result.unwrap_err().to_string(), "undefined variable `y`");
+        let (output, message) =
+            output_and_error("print(1)\nif true:\nprint(2)\nprint(y)\nend\nprint(3)");
+        assert_eq!(output, "1\n2\n");
+        assert_eq!(message, "undefined variable `y`");
     }
 
     const SHOW: &str = "def show(n):\nprint(n)\nreturn n\nend\n";

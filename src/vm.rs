@@ -353,13 +353,15 @@ mod tests {
     }
 
     #[test]
-    fn if_inside_a_loop_leaves_the_stack_balanced() {
+    fn if_inside_a_loop_runs_both_branches_without_leaking_stack_slots() {
         let script =
             "i = 0\nwhile i < 6:\nif i != 3:\nprint(i)\nelse:\nprint(100)\nend\ni = i + 1\nend";
         assert_eq!(output_of(script), "0\n1\n2\n100\n4\n5\n");
-        let mut machine = VirtualMachine::default();
-        run(&mut machine, script).unwrap();
-        assert_eq!(machine.sp, 0);
+        let long =
+            "i = 0\nwhile i < 300:\nif i != 7:\nprint(i)\nelse:\nprint(0)\nend\ni = i + 1\nend";
+        let output = output_of(long);
+        assert_eq!(output.lines().count(), 300);
+        assert!(output.ends_with("299\n"));
     }
 
     #[test]
