@@ -34,11 +34,24 @@ impl<'a> Lexer<'a> {
                 .take_while(|b| b.is_ascii_digit())
                 .parse()
                 .map_or(Token::Illegal, Token::Int),
+            b'"' => self.string_literal(),
             _ => {
                 self.pos += 1;
                 self.punctuation(byte)
             }
         }
+    }
+
+    fn string_literal(&mut self) -> Token<'a> {
+        self.pos += 1;
+        let start = self.pos;
+        self.advance_while(|b| b != b'"' && b != b'\n');
+        if self.peek() != Some(b'"') {
+            return Token::Illegal;
+        }
+        let text = &self.input[start..self.pos];
+        self.pos += 1;
+        Token::String(text)
     }
 
     fn punctuation(&mut self, byte: u8) -> Token<'a> {
@@ -53,6 +66,8 @@ impl<'a> Lexer<'a> {
             b',' => Token::Comma,
             b'(' => Token::LParen,
             b')' => Token::RParen,
+            b'[' => Token::LBracket,
+            b']' => Token::RBracket,
             b'=' if self.peek() == Some(b'=') => {
                 self.pos += 1;
                 Token::EqEq
@@ -155,7 +170,9 @@ mod tests {
     #[test]
     fn matches_keywords_only_on_whole_words() {
         assert_eq!(
-            tokenize("if else while end def return print iffy _print end_x endless _end End END"),
+            tokenize(
+                "if else while end def return print true false iffy _print end_x endless _end End END truest"
+            ),
             [
                 Token::If,
                 Token::Else,
@@ -164,6 +181,8 @@ mod tests {
                 Token::Def,
                 Token::Return,
                 Token::Print,
+                Token::True,
+                Token::False,
                 Token::Ident("iffy"),
                 Token::Ident("_print"),
                 Token::Ident("end_x"),
@@ -171,6 +190,7 @@ mod tests {
                 Token::Ident("_end"),
                 Token::Ident("End"),
                 Token::Ident("END"),
+                Token::Ident("truest"),
                 Token::Eof,
             ]
         );
@@ -206,6 +226,57 @@ mod tests {
                 Token::RParen,
                 Token::Colon,
                 Token::Newline,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_string_literals_without_their_quotes() {
+        assert_eq!(
+            tokenize("x = \"hello world\" \"\" \"h\u{e9}llo\""),
+            [
+                Token::Ident("x"),
+                Token::Assign,
+                Token::String("hello world"),
+                Token::String(""),
+                Token::String("h\u{e9}llo"),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_string_is_illegal_and_stops_at_the_line_end() {
+        assert_eq!(
+            tokenize("x = \"abc\ny"),
+            [
+                Token::Ident("x"),
+                Token::Assign,
+                Token::Illegal,
+                Token::Newline,
+                Token::Ident("y"),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(tokenize("\"abc"), [Token::Illegal, Token::Eof]);
+    }
+
+    #[test]
+    fn tokenizes_array_literal_and_index_brackets() {
+        assert_eq!(
+            tokenize("[1, \"a\", true][0]"),
+            [
+                Token::LBracket,
+                Token::Int(1),
+                Token::Comma,
+                Token::String("a"),
+                Token::Comma,
+                Token::True,
+                Token::RBracket,
+                Token::LBracket,
+                Token::Int(0),
+                Token::RBracket,
                 Token::Eof,
             ]
         );

@@ -14,6 +14,8 @@ pub type Scope = Rc<RefCell<Environment>>;
 pub enum Value {
     Int(i64),
     Bool(bool),
+    String(String),
+    Array(Vec<Value>),
     Unit,
     Function(Rc<Function>),
 }
@@ -40,11 +42,38 @@ impl fmt::Debug for Function {
     }
 }
 
+impl Value {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "integer",
+            Value::Bool(_) => "boolean",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Unit => "unit",
+            Value::Function(_) => "function",
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(value) => write!(f, "{value}"),
             Value::Bool(value) => write!(f, "{value}"),
+            Value::String(text) => f.write_str(text),
+            Value::Array(items) => {
+                f.write_str("[")?;
+                for (position, item) in items.iter().enumerate() {
+                    if position > 0 {
+                        f.write_str(", ")?;
+                    }
+                    match item {
+                        Value::String(text) => write!(f, "\"{text}\"")?,
+                        other => write!(f, "{other}")?,
+                    }
+                }
+                f.write_str("]")
+            }
             Value::Unit => f.write_str("unit"),
             Value::Function(function) => write!(f, "<function {}>", function.name),
         }
@@ -56,10 +85,17 @@ pub enum RuntimeError {
     UndefinedVariable(String),
     TypeMismatch {
         op: BinaryOp,
-        left: Value,
-        right: Value,
+        left: &'static str,
+        right: &'static str,
     },
-    NonBooleanCondition(Value),
+    NonBooleanCondition(&'static str),
+    NotIndexable(&'static str),
+    NonIntegerIndex(&'static str),
+    IndexOutOfRange {
+        index: i64,
+        length: usize,
+    },
+    ElementAssignment(&'static str),
     NotCallable(String),
     ArityMismatch {
         name: String,
@@ -80,8 +116,18 @@ impl fmt::Display for RuntimeError {
             RuntimeError::TypeMismatch { op, left, right } => {
                 write!(f, "cannot apply `{op}` to {left} and {right}")
             }
-            RuntimeError::NonBooleanCondition(value) => {
-                write!(f, "while condition must be a boolean, found {value}")
+            RuntimeError::NonBooleanCondition(found) => {
+                write!(f, "while condition must be a boolean, found {found}")
+            }
+            RuntimeError::NotIndexable(found) => write!(f, "cannot index {found}"),
+            RuntimeError::NonIntegerIndex(found) => {
+                write!(f, "index must be an integer, found {found}")
+            }
+            RuntimeError::IndexOutOfRange { index, length } => {
+                write!(f, "index {index} out of range for length {length}")
+            }
+            RuntimeError::ElementAssignment(found) => {
+                write!(f, "cannot assign to an element of {found}")
             }
             RuntimeError::NotCallable(name) => write!(f, "`{name}` is not a function"),
             RuntimeError::ArityMismatch {
@@ -136,9 +182,20 @@ impl Environment {
     }
 
     fn get(&self, name: &str) -> Option<Value> {
+        self.read(name, Value::clone)
+    }
+
+    fn read<R>(&self, name: &str, reader: impl FnOnce(&Value) -> R) -> Option<R> {
         match self.variables.get(name) {
-            Some(value) => Some(value.clone()),
-            None => self.parent.as_ref()?.borrow().get(name),
+            Some(value) => Some(reader(value)),
+            None => self.parent.as_ref()?.borrow().read(name, reader),
+        }
+    }
+
+    fn modify<R>(&mut self, name: &str, modifier: impl FnOnce(&mut Value) -> R) -> Option<R> {
+        match self.variables.get_mut(name) {
+            Some(value) => Some(modifier(value)),
+            None => self.parent.as_ref()?.borrow_mut().modify(name, modifier),
         }
     }
 
@@ -203,6 +260,14 @@ fn run_statement(
             let value = eval(scope, value, out)?;
             scope.borrow_mut().assign(name, value);
         }
+        Statement::IndexAssign { name, index, value } => {
+            let index = eval(scope, index, out)?;
+            let value = eval(scope, value, out)?;
+            scope
+                .borrow_mut()
+                .modify(name, |target| store_element(target, &index, value))
+                .ok_or_else(|| RuntimeError::UndefinedVariable(name.clone()))??;
+        }
         Statement::Print(expression) => {
             let value = eval(scope, expression, out)?;
             writeln!(out, "{value}")?;
@@ -246,6 +311,27 @@ fn eval(
 ) -> Result<Value, RuntimeError> {
     match expression {
         Expression::Int(value) => Ok(Value::Int(*value)),
+        Expression::Bool(value) => Ok(Value::Bool(*value)),
+        Expression::String(text) => Ok(Value::String(text.clone())),
+        Expression::Array(items) => items
+            .iter()
+            .map(|item| eval(scope, item, out))
+            .collect::<Result<_, _>>()
+            .map(Value::Array),
+        Expression::Index { target, index } => match target.as_ref() {
+            Expression::Ident(name) => {
+                let index = eval(scope, index, out)?;
+                scope
+                    .borrow()
+                    .read(name, |value| element(value, &index))
+                    .ok_or_else(|| RuntimeError::UndefinedVariable(name.clone()))?
+            }
+            target => {
+                let target = eval(scope, target, out)?;
+                let index = eval(scope, index, out)?;
+                element(&target, &index)
+            }
+        },
         Expression::Ident(name) => scope
             .borrow()
             .get(name)
@@ -302,17 +388,83 @@ fn condition_holds(
 ) -> Result<bool, RuntimeError> {
     match eval(scope, condition, out)? {
         Value::Bool(holds) => Ok(holds),
-        other => Err(RuntimeError::NonBooleanCondition(other)),
+        other => Err(RuntimeError::NonBooleanCondition(other.type_name())),
     }
 }
 
 fn apply(op: BinaryOp, left: Value, right: Value) -> Result<Value, RuntimeError> {
-    match (&left, &right) {
-        (Value::Int(left), Value::Int(right)) => apply_int(op, *left, *right),
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => apply_int(op, left, right),
         (Value::Bool(left), Value::Bool(right)) if op == BinaryOp::Equal => {
             Ok(Value::Bool(left == right))
         }
-        _ => Err(RuntimeError::TypeMismatch { op, left, right }),
+        (Value::String(left), Value::String(right)) if op == BinaryOp::Equal => {
+            Ok(Value::Bool(left == right))
+        }
+        (Value::String(mut left), Value::String(right)) if op == BinaryOp::Add => {
+            left.push_str(&right);
+            Ok(Value::String(left))
+        }
+        (Value::String(left), Value::Int(right)) if op == BinaryOp::Add => {
+            Ok(Value::String(format!("{left}{right}")))
+        }
+        (Value::Int(left), Value::String(right)) if op == BinaryOp::Add => {
+            Ok(Value::String(format!("{left}{right}")))
+        }
+        (left, right) => Err(RuntimeError::TypeMismatch {
+            op,
+            left: left.type_name(),
+            right: right.type_name(),
+        }),
+    }
+}
+
+fn element(value: &Value, index: &Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Array(items) => {
+            let index = integer_index(index)?;
+            usize::try_from(index)
+                .ok()
+                .and_then(|position| items.get(position))
+                .cloned()
+                .ok_or(RuntimeError::IndexOutOfRange {
+                    index,
+                    length: items.len(),
+                })
+        }
+        Value::String(text) => {
+            let index = integer_index(index)?;
+            usize::try_from(index)
+                .ok()
+                .and_then(|position| text.chars().nth(position))
+                .map(|character| Value::String(character.to_string()))
+                .ok_or_else(|| RuntimeError::IndexOutOfRange {
+                    index,
+                    length: text.chars().count(),
+                })
+        }
+        other => Err(RuntimeError::NotIndexable(other.type_name())),
+    }
+}
+
+fn store_element(target: &mut Value, index: &Value, value: Value) -> Result<(), RuntimeError> {
+    let Value::Array(items) = target else {
+        return Err(RuntimeError::ElementAssignment(target.type_name()));
+    };
+    let index = integer_index(index)?;
+    let length = items.len();
+    let slot = usize::try_from(index)
+        .ok()
+        .and_then(|position| items.get_mut(position))
+        .ok_or(RuntimeError::IndexOutOfRange { index, length })?;
+    *slot = value;
+    Ok(())
+}
+
+fn integer_index(index: &Value) -> Result<i64, RuntimeError> {
+    match index {
+        Value::Int(index) => Ok(*index),
+        other => Err(RuntimeError::NonIntegerIndex(other.type_name())),
     }
 }
 
@@ -560,21 +712,131 @@ mod tests {
     }
 
     #[test]
+    fn strings_and_arrays_work_end_to_end() {
+        let script = "arr = [10, 20, 30] \n msg = \"Value is \" \n print(msg + arr[1])";
+        assert_eq!(output_of(script), "Value is 20\n");
+    }
+
+    #[test]
+    fn array_literals_evaluate_their_elements_left_to_right() {
+        let script = "def show(n):\nprint(n)\nreturn n\nend\n\
+                      xs = [show(1), show(2) + 1, show(3)]\nprint(xs)";
+        assert_eq!(output_of(script), "1\n2\n3\n[1, 3, 3]\n");
+    }
+
+    #[test]
+    fn prints_nested_arrays_with_quoted_strings() {
+        let script = "print([1, 2, \"three\", true])\nprint([])\n\
+                      print([[1, 2], [\"a\"]])\nprint(\"plain\")\nprint(\"\")";
+        assert_eq!(
+            output_of(script),
+            "[1, 2, \"three\", true]\n[]\n[[1, 2], [\"a\"]]\nplain\n\n"
+        );
+    }
+
+    #[test]
+    fn indexes_arrays_strings_and_nested_arrays() {
+        let script = "xs = [10, 20, 30]\nprint(xs[0])\nprint(xs[1 + 1])\n\
+                      m = [[1, 2], [3, 4]]\nprint(m[1][0])\nprint([5, 6][1])\n\
+                      print(\"hello\"[1])\ns = \"h\u{e9}llo\"\nprint(s[1])";
+        assert_eq!(output_of(script), "10\n30\n3\n6\ne\n\u{e9}\n");
+    }
+
+    #[test]
+    fn index_expressions_may_call_functions_and_nest() {
+        let script = "def one():\nreturn 1\nend\nxs = [7, 8, 9]\n\
+                      print(xs[one()])\nprint(xs[xs[0] - 6])";
+        assert_eq!(output_of(script), "8\n8\n");
+    }
+
+    #[test]
+    fn assigns_into_arrays_in_place() {
+        let script = "xs = [1, 2, 3]\nxs[0] = 10\nxs[1 + 1] = xs[0] + 5\nprint(xs)";
+        assert_eq!(output_of(script), "[10, 2, 15]\n");
+    }
+
+    #[test]
+    fn index_assignment_evaluates_index_before_value() {
+        let script = "def show(n):\nprint(n)\nreturn n\nend\n\
+                      xs = [1]\nxs[show(0)] = show(7)\nprint(xs)";
+        assert_eq!(output_of(script), "0\n7\n[7]\n");
+    }
+
+    #[test]
+    fn arrays_have_value_semantics() {
+        let script = "a = [1, 2]\nb = a\nb[0] = 9\nprint(a)\nprint(b)\n\
+                      def clobber(xs):\nxs[0] = 99\nreturn xs\nend\n\
+                      c = clobber(a)\nprint(a)\nprint(c)";
+        assert_eq!(output_of(script), "[1, 2]\n[9, 2]\n[1, 2]\n[99, 2]\n");
+    }
+
+    #[test]
+    fn functions_update_enclosing_arrays_through_the_scope_chain() {
+        let script = "log = [0, 0]\ndef bump(i):\nlog[i] = log[i] + 1\nend\n\
+                      bump(1)\nbump(1)\nprint(log)";
+        assert_eq!(output_of(script), "[0, 2]\n");
+    }
+
+    #[test]
+    fn loops_read_and_write_array_elements() {
+        let script = "xs = [3, 1, 2]\ni = 0\ntotal = 0\n\
+                      while i < 3:\ntotal = total + xs[i]\nxs[i] = xs[i] * 10\ni = i + 1\nend\n\
+                      print(total)\nprint(xs)";
+        assert_eq!(output_of(script), "6\n[30, 10, 20]\n");
+    }
+
+    #[test]
+    fn concatenates_strings_with_strings_and_integers() {
+        let script = "print(\"a\" + \"b\")\nprint(\"n=\" + 5)\nprint(5 + \"x\")\n\
+                      print(\"a\" + \"b\" + 1 + 2)\nprint(1 + 2 + \"x\")\nprint(\"\" + \"\")";
+        assert_eq!(output_of(script), "ab\nn=5\n5x\nab12\n3x\n\n");
+    }
+
+    #[test]
+    fn strings_compare_for_equality() {
+        let script = "print(\"a\" == \"a\")\nprint(\"a\" == \"b\")\nprint(\"\" == \"\")";
+        assert_eq!(output_of(script), "true\nfalse\ntrue\n");
+    }
+
+    #[test]
+    fn arrays_persist_between_runs() {
+        let globals = Environment::global();
+        run(&globals, "xs = [1]").unwrap();
+        assert_eq!(run(&globals, "xs[0] = 5\nprint(xs)").unwrap(), "[5]\n");
+    }
+
+    #[test]
+    fn failed_index_assignment_leaves_the_array_unchanged() {
+        let globals = Environment::global();
+        assert!(run(&globals, "xs = [1, 2]\nxs[5] = 0").is_err());
+        assert_eq!(
+            globals.borrow().get("xs"),
+            Some(Value::Array(vec![Value::Int(1), Value::Int(2)]))
+        );
+    }
+
+    #[test]
     fn reports_runtime_errors() {
         let cases = [
             ("print(y)", "undefined variable `y`"),
             ("x = x + 1", "undefined variable `x`"),
             ("print(1 / 0)", "division by zero"),
             ("print(0 / 0)", "division by zero"),
-            ("print(1 + (2 < 3))", "cannot apply `+` to 1 and true"),
-            ("print(1 == (1 < 2))", "cannot apply `==` to 1 and true"),
+            (
+                "print(1 + (2 < 3))",
+                "cannot apply `+` to integer and boolean",
+            ),
+            (
+                "print(1 == (1 < 2))",
+                "cannot apply `==` to integer and boolean",
+            ),
             (
                 "print((1 < 2) > (2 < 3))",
-                "cannot apply `>` to true and true",
+                "cannot apply `>` to boolean and boolean",
             ),
             (
                 "while 1:\nend",
-                "while condition must be a boolean, found 1",
+                "while condition must be a boolean, found integer",
             ),
             ("print(9223372036854775807 + 1)", "integer overflow"),
             ("print(0 - 9223372036854775807 - 2)", "integer overflow"),
@@ -588,6 +850,67 @@ mod tests {
                 "line 1: expected expression, found end of input",
             ),
             ("nope(1)", "undefined variable `nope`"),
+            (
+                "xs = [1, 2, 3]\nprint(xs[3])",
+                "index 3 out of range for length 3",
+            ),
+            (
+                "xs = [1]\nprint(xs[0 - 1])",
+                "index -1 out of range for length 1",
+            ),
+            ("xs = []\nprint(xs[0])", "index 0 out of range for length 0"),
+            ("print(\"abc\"[3])", "index 3 out of range for length 3"),
+            (
+                "print(\"h\u{e9}llo\"[5])",
+                "index 5 out of range for length 5",
+            ),
+            (
+                "xs = [1]\nprint(xs[true])",
+                "index must be an integer, found boolean",
+            ),
+            (
+                "xs = [1]\nprint(xs[\"a\"])",
+                "index must be an integer, found string",
+            ),
+            ("x = 5\nprint(x[0])", "cannot index integer"),
+            ("print(true[0])", "cannot index boolean"),
+            ("def f():\nend\nprint(f[0])", "cannot index function"),
+            ("def f():\nreturn\nend\nprint(f()[0])", "cannot index unit"),
+            ("print(nope[0])", "undefined variable `nope`"),
+            ("nope[0] = 1", "undefined variable `nope`"),
+            (
+                "s = \"abc\"\ns[0] = \"x\"",
+                "cannot assign to an element of string",
+            ),
+            ("x = 1\nx[0] = 2", "cannot assign to an element of integer"),
+            ("xs = [1]\nxs[1] = 2", "index 1 out of range for length 1"),
+            (
+                "xs = [1]\nxs[true] = 2",
+                "index must be an integer, found boolean",
+            ),
+            (
+                "print(\"a\" + true)",
+                "cannot apply `+` to string and boolean",
+            ),
+            ("print(\"a\" - 1)", "cannot apply `-` to string and integer"),
+            ("print([1] + [2])", "cannot apply `+` to array and array"),
+            (
+                "print(\"a\" == 1)",
+                "cannot apply `==` to string and integer",
+            ),
+            ("print([1] == [1])", "cannot apply `==` to array and array"),
+            (
+                "while \"x\":\nend",
+                "while condition must be a boolean, found string",
+            ),
+            (
+                "print(\"abc",
+                "line 1: expected expression, found illegal token",
+            ),
+            (
+                "xs = [1, 2\nprint(xs)",
+                "line 1: expected `]`, found newline",
+            ),
             ("x = 1\nx(2)", "`x` is not a function"),
             ("return 1", "`return` outside of a function"),
             (
@@ -600,15 +923,15 @@ mod tests {
             ),
             (
                 "def f():\nreturn 1\nend\nprint(f + 1)",
-                "cannot apply `+` to <function f> and 1",
+                "cannot apply `+` to function and integer",
             ),
             (
                 "def f():\nreturn\nend\nprint(f() + 1)",
-                "cannot apply `+` to unit and 1",
+                "cannot apply `+` to unit and integer",
             ),
             (
                 "def f():\nreturn 1\nend\nprint(f == f)",
-                "cannot apply `==` to <function f> and <function f>",
+                "cannot apply `==` to function and function",
             ),
         ];
         for (source, message) in cases {

@@ -14,7 +14,14 @@ pub enum BinaryOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expression {
     Int(i64),
+    Bool(bool),
+    String(String),
     Ident(String),
+    Array(Vec<Expression>),
+    Index {
+        target: Box<Expression>,
+        index: Box<Expression>,
+    },
     Binary {
         op: BinaryOp,
         left: Box<Expression>,
@@ -30,6 +37,11 @@ pub enum Expression {
 pub enum Statement {
     Assign {
         name: String,
+        value: Expression,
+    },
+    IndexAssign {
+        name: String,
+        index: Expression,
         value: Expression,
     },
     Print(Expression),
