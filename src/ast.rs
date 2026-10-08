@@ -1,4 +1,5 @@
 use std::fmt;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
@@ -77,7 +78,7 @@ pub enum Statement {
     FunctionDef {
         name: String,
         params: Vec<String>,
-        body: Vec<Statement>,
+        body: Rc<[Statement]>,
     },
     Return(Option<Expression>),
     Expression(Expression),

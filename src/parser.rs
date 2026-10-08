@@ -131,7 +131,7 @@ impl<'a> Parser<'a> {
                 Statement::FunctionDef {
                     name,
                     params,
-                    body: self.parse_block(&[Token::End])?,
+                    body: self.parse_block(&[Token::End])?.into(),
                 }
             }
             Token::Return => {
@@ -595,11 +595,12 @@ mod tests {
             [Statement::FunctionDef {
                 name: "add".to_owned(),
                 params: vec!["a".to_owned(), "b".to_owned()],
-                body: vec![Statement::Return(Some(binary(
+                body: [Statement::Return(Some(binary(
                     BinaryOp::Add,
                     ident("a"),
                     ident("b"),
-                )))],
+                )))]
+                .into(),
             }]
         );
     }
@@ -611,7 +612,7 @@ mod tests {
             [Statement::FunctionDef {
                 name: "f".to_owned(),
                 params: vec![],
-                body: vec![Statement::Return(None)],
+                body: [Statement::Return(None)].into(),
             }]
         );
     }
@@ -1086,11 +1087,12 @@ mod tests {
                 Statement::FunctionDef {
                     name: "f".to_owned(),
                     params: vec![],
-                    body: vec![if_statement(
+                    body: [if_statement(
                         Expression::Bool(true),
                         vec![Statement::Return(None)],
                         vec![],
-                    )],
+                    )]
+                    .into(),
                 },
             ]
         );
@@ -1112,6 +1114,185 @@ mod tests {
                     binary(BinaryOp::GreaterEqual, ident("c"), ident("d")),
                 )
             )]
+        );
+    }
+
+    #[test]
+    fn postfix_chains_parse_as_assignment_targets_and_expression_statements() {
+        let method = |target: &str, name: &str| Expression::MethodCall {
+            target: Box::new(ident(target)),
+            method: name.to_owned(),
+            arguments: vec![],
+        };
+        assert_eq!(
+            parse("a.b()[2] = 3").unwrap(),
+            [Statement::IndexAssign {
+                target: method("a", "b"),
+                index: Expression::Int(2),
+                value: Expression::Int(3),
+            }]
+        );
+        let slice = Expression::Slice {
+            target: Box::new(ident("xs")),
+            start: Some(Box::new(Expression::Int(1))),
+            end: Some(Box::new(Expression::Int(2))),
+        };
+        assert_eq!(
+            parse("xs[1:2][0] = 5").unwrap(),
+            [Statement::IndexAssign {
+                target: slice,
+                index: Expression::Int(0),
+                value: Expression::Int(5),
+            }]
+        );
+        assert_eq!(
+            parse("xs.pop()[0]").unwrap(),
+            [Statement::Expression(index(
+                method("xs", "pop"),
+                Expression::Int(0)
+            ))]
+        );
+        assert_eq!(
+            parse("xs[1:3].len()").unwrap(),
+            [Statement::Expression(Expression::MethodCall {
+                target: Box::new(Expression::Slice {
+                    target: Box::new(ident("xs")),
+                    start: Some(Box::new(Expression::Int(1))),
+                    end: Some(Box::new(Expression::Int(3))),
+                }),
+                method: "len".to_owned(),
+                arguments: vec![],
+            })]
+        );
+    }
+
+    #[test]
+    fn the_lowest_precedence_operator_is_accepted_in_every_nested_position() {
+        let sources = [
+            "x = f(a == b)",
+            "xs.push(a == b)",
+            "x = [a == b]",
+            "x = (a == b) + 1",
+            "x = xs[a == b]",
+            "x = xs[a == b : c == d]",
+            "def f():\nreturn a == b\nend",
+            "xs[0] = a == b",
+            "print(a != b)",
+        ];
+        for source in sources {
+            assert!(parse(source).is_ok(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn bare_index_statements_and_returns_parse_and_slice_bounds_are_full_expressions() {
+        assert_eq!(
+            parse("xs[0]\nxs[-1]").unwrap(),
+            [
+                Statement::Expression(index(ident("xs"), Expression::Int(0))),
+                Statement::Expression(index(
+                    ident("xs"),
+                    Expression::Negate(Box::new(Expression::Int(1)))
+                )),
+            ]
+        );
+        assert_eq!(parse("return").unwrap(), [Statement::Return(None)]);
+        assert_eq!(
+            parse("a = xs[i + 1:n * 2 < m]").unwrap(),
+            [assign(
+                "a",
+                Expression::Slice {
+                    target: Box::new(ident("xs")),
+                    start: Some(Box::new(binary(
+                        BinaryOp::Add,
+                        ident("i"),
+                        Expression::Int(1)
+                    ))),
+                    end: Some(Box::new(binary(
+                        BinaryOp::Less,
+                        binary(BinaryOp::Multiply, ident("n"), Expression::Int(2)),
+                        ident("m"),
+                    ))),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn multiplication_and_division_share_one_left_associative_level() {
+        assert_eq!(
+            parse("x = 8 * 2 / 4").unwrap(),
+            [assign(
+                "x",
+                binary(
+                    BinaryOp::Divide,
+                    binary(BinaryOp::Multiply, Expression::Int(8), Expression::Int(2)),
+                    Expression::Int(4),
+                )
+            )]
+        );
+        assert_eq!(
+            parse("x = 8 / 2 * 4").unwrap(),
+            [assign(
+                "x",
+                binary(
+                    BinaryOp::Multiply,
+                    binary(BinaryOp::Divide, Expression::Int(8), Expression::Int(2)),
+                    Expression::Int(4),
+                )
+            )]
+        );
+    }
+
+    #[test]
+    fn every_token_kind_is_named_in_error_messages() {
+        let statement_starts = [
+            ("+ 1", "`+`"),
+            ("- 1", "`-`"),
+            ("* 1", "`*`"),
+            ("/ 1", "`/`"),
+            ("== 1", "`==`"),
+            ("!= 1", "`!=`"),
+            ("> 1", "`>`"),
+            (">= 1", "`>=`"),
+            ("< 1", "`<`"),
+            ("<= 1", "`<=`"),
+            ("else", "`else`"),
+            ("end", "`end`"),
+            ("true", "`true`"),
+            ("false", "`false`"),
+            (", 1", "`,`"),
+            (". 1", "`.`"),
+            (": 1", "`:`"),
+            ("( 1", "`(`"),
+            (") 1", "`)`"),
+            ("[ 1", "`[`"),
+            ("] 1", "`]`"),
+            ("5", "integer `5`"),
+            ("\"s\"", "string \"s\""),
+            ("@", "illegal token"),
+        ];
+        for (source, found) in statement_starts {
+            assert_eq!(
+                parse(source).unwrap_err().to_string(),
+                format!("line 1: expected statement, found {found}"),
+                "{source:?}"
+            );
+        }
+        for keyword in ["while", "def", "print", "else", "if", "return"] {
+            assert_eq!(
+                parse(&format!("x = {keyword}")).unwrap_err().to_string(),
+                format!("line 1: expected expression, found `{keyword}`"),
+                "{keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn carriage_returns_do_not_count_as_lines() {
+        assert_eq!(
+            parse("x = 1\r\n\r\ny = )").unwrap_err().to_string(),
+            "line 3: expected expression, found `)`"
         );
     }
 }

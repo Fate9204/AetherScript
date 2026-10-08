@@ -440,4 +440,25 @@ mod tests {
         assert_eq!(tokenize("! ="), [Token::Illegal, Token::Assign, Token::Eof]);
         assert_eq!(tokenize("< ="), [Token::Lt, Token::Assign, Token::Eof]);
     }
+
+    #[test]
+    fn identifiers_may_contain_digits_and_underscores_after_the_first_character() {
+        assert_eq!(
+            tokenize("x1 _2 a_b3 y10"),
+            [
+                Token::Ident("x1"),
+                Token::Ident("_2"),
+                Token::Ident("a_b3"),
+                Token::Ident("y10"),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn crlf_line_endings_advance_the_line_counter_once() {
+        let mut lexer = Lexer::new("a\r\nb\r\n\r\nc");
+        while lexer.next_token() != Token::Eof {}
+        assert_eq!(lexer.line(), 4);
+    }
 }

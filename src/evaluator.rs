@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::ops::Range;
@@ -24,7 +24,7 @@ pub enum Value {
 pub struct Function {
     name: String,
     params: Vec<String>,
-    body: Vec<Statement>,
+    body: Rc<[Statement]>,
     closure: Scope,
 }
 
@@ -63,7 +63,7 @@ impl Value {
         &self,
         f: &mut fmt::Formatter<'_>,
         quoted: bool,
-        open: &mut Vec<*const RefCell<Vec<Value>>>,
+        open: &mut HashSet<*const RefCell<Vec<Value>>>,
     ) -> fmt::Result {
         match self {
             Value::Int(value) => write!(f, "{value}"),
@@ -74,10 +74,9 @@ impl Value {
             Value::Function(function) => write!(f, "<function {}>", function.name),
             Value::Array(items) => {
                 let identity = Rc::as_ptr(items);
-                if open.contains(&identity) {
+                if !open.insert(identity) {
                     return f.write_str("[...]");
                 }
-                open.push(identity);
                 f.write_str("[")?;
                 for (position, item) in items.borrow().iter().enumerate() {
                     if position > 0 {
@@ -85,7 +84,7 @@ impl Value {
                     }
                     item.write_to(f, true, open)?;
                 }
-                open.pop();
+                open.remove(&identity);
                 f.write_str("]")
             }
         }
@@ -94,7 +93,7 @@ impl Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.write_to(f, false, &mut Vec::new())
+        self.write_to(f, false, &mut HashSet::new())
     }
 }
 
@@ -317,7 +316,7 @@ fn run_statement(
             let function = Function {
                 name: name.clone(),
                 params: params.clone(),
-                body: body.clone(),
+                body: Rc::clone(body),
                 closure: Rc::clone(scope),
             };
             scope
@@ -1345,5 +1344,291 @@ mod tests {
             "print(1)\nif true:\nprint(2)\nprint(y)\nend\nprint(3)",
         );
         assert_eq!(result.unwrap_err().to_string(), "undefined variable `y`");
+    }
+
+    const SHOW: &str = "def show(n):\nprint(n)\nreturn n\nend\n";
+
+    fn on_large_stack<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> T {
+        thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(job)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn output_and_error(source: &str) -> (String, String) {
+        let statements = Parser::new(Lexer::new(source)).parse_program().unwrap();
+        let mut output = Vec::new();
+        let error = execute(&Environment::global(), &statements, &mut output).unwrap_err();
+        (String::from_utf8(output).unwrap(), error.to_string())
+    }
+
+    #[test]
+    fn shared_arrays_print_in_full_and_only_true_cycles_collapse() {
+        assert_eq!(
+            output_of("a = [1]\nb = [a, a]\nprint(b)\nprint([b, b])"),
+            "[[1], [1]]\n[[[1], [1]], [[1], [1]]]\n"
+        );
+        assert_eq!(
+            output_of("x = [1]\nl = [x]\nr = [x]\nprint([l, r])"),
+            "[[[1]], [[1]]]\n"
+        );
+        assert_eq!(
+            output_of("a = []\nb = [a]\nc = [b]\na.push(c)\nprint(a)"),
+            "[[[[...]]]]\n"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_arrays_print_completely() {
+        let script = "l = []\ni = 0\nwhile i < 20000:\nl = [l]\ni = i + 1\nend\nprint(l)";
+        let printed = on_large_stack(move || output_of(script));
+        assert_eq!(printed.len(), 2 * 20001 + 1);
+    }
+
+    #[test]
+    fn the_call_depth_limit_is_exactly_one_thousand() {
+        assert_eq!(MAX_CALL_DEPTH, 1000);
+        let definition = "def down(n):\nif n == 0:\nreturn 0\nend\nreturn down(n - 1)\nend\n";
+        let reaches_the_limit = format!("{definition}print(down({}))", MAX_CALL_DEPTH - 1);
+        let passes_it = format!("{definition}print(down({MAX_CALL_DEPTH}))");
+        assert_eq!(on_large_stack(move || output_of(&reaches_the_limit)), "0\n");
+        assert_eq!(
+            on_large_stack(move || error_of(&passes_it)),
+            "call depth exceeded (limit 1000)"
+        );
+    }
+
+    #[test]
+    fn method_arity_is_checked_before_any_argument_runs() {
+        let calls = [
+            "print(xs.len(show(1)))",
+            "print(xs.pop(show(1)))",
+            "xs.push(show(1), show(2))",
+            "xs.push()",
+            "print(xs.nope(show(1)))",
+            "print(\"abc\".len(show(1)))",
+            "print(\"abc\".nope(show(1)))",
+        ];
+        for call in calls {
+            let (output, _) = output_and_error(&format!("{SHOW}xs = [1]\n{call}"));
+            assert_eq!(output, "", "{call}");
+        }
+    }
+
+    #[test]
+    fn method_arity_errors_name_the_method_and_both_counts() {
+        let cases = [
+            (
+                "xs = [1]\nxs.pop(1)",
+                "wrong number of arguments to `pop`: expected 0, found 1",
+            ),
+            (
+                "print(\"abc\".len(1))",
+                "wrong number of arguments to `len`: expected 0, found 1",
+            ),
+            (
+                "xs = [1]\nxs.push(1, 2)",
+                "wrong number of arguments to `push`: expected 1, found 2",
+            ),
+        ];
+        for (source, message) in cases {
+            assert_eq!(error_of(source), message, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn operands_evaluate_left_to_right_in_every_expression_form() {
+        let setup = format!("{SHOW}def pick(xs):\nprint(100)\nreturn xs\nend\nxs = [10, 20, 30]\n");
+        let cases = [
+            ("print(pick(xs)[show(1)])", "100\n1\n20\n"),
+            ("print(pick(xs)[show(0):show(2)])", "100\n0\n2\n[10, 20]\n"),
+            ("print(show(1) + show(2))", "1\n2\n3\n"),
+            ("pick(xs).push(show(7))", "100\n7\n"),
+        ];
+        for (statement, expected) in cases {
+            assert_eq!(output_of(&format!("{setup}{statement}")), expected);
+        }
+        let (output, message) = output_and_error(&format!("{setup}xs[5] = show(7)"));
+        assert_eq!(output, "7\n");
+        assert_eq!(message, "index 5 out of range for length 3");
+    }
+
+    #[test]
+    fn extreme_integer_bounds_clamp_or_report_without_panicking() {
+        let bounds =
+            "xs = [1, 2, 3]\nlow = 0 - 9223372036854775807 - 1\nhigh = 9223372036854775807\n";
+        let script = format!(
+            "{bounds}print(xs[low:])\nprint(xs[:low])\nprint(\"abc\"[low:2])\nprint(xs[low:high])\n\
+             print(xs[high:low])\nprint(xs[high:])\nprint(xs[:high])"
+        );
+        assert_eq!(
+            output_of(&script),
+            "[1, 2, 3]\n[]\nab\n[1, 2, 3]\n[]\n[]\n[1, 2, 3]\n"
+        );
+        let cases = [
+            (
+                "print(xs[low])",
+                "index -9223372036854775808 out of range for length 3",
+            ),
+            (
+                "xs[low] = 0",
+                "index -9223372036854775808 out of range for length 3",
+            ),
+            (
+                "print(xs[high])",
+                "index 9223372036854775807 out of range for length 3",
+            ),
+        ];
+        for (statement, message) in cases {
+            assert_eq!(error_of(&format!("{bounds}{statement}")), message);
+        }
+    }
+
+    #[test]
+    fn method_calls_read_their_arguments_before_borrowing_the_receiver() {
+        let cases = [
+            (
+                "xs = [5]\nxs.push(xs.len())\nxs.push(xs[0])\nprint(xs)",
+                "[5, 1, 5]\n",
+            ),
+            (
+                "xs = [1, 2, 3]\nxs.push(xs.pop())\nprint(xs)",
+                "[1, 2, 3]\n",
+            ),
+            (
+                "xs = [1, 2]\ndef m():\nxs.pop()\nreturn 7\nend\nxs.push(m())\nprint(xs)",
+                "[1, 7]\n",
+            ),
+        ];
+        for (script, expected) in cases {
+            assert_eq!(output_of(script), expected, "{script:?}");
+        }
+    }
+
+    #[test]
+    fn pop_hands_back_the_shared_element_not_a_copy() {
+        let script =
+            "inner = [1]\nouter = [inner]\np = outer.pop()\np.push(2)\nprint(inner)\nprint(outer)";
+        assert_eq!(output_of(script), "[1, 2]\n[]\n");
+    }
+
+    #[test]
+    fn a_failing_output_stream_becomes_an_output_error() {
+        struct Broken;
+
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("disk full"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let statements = Parser::new(Lexer::new("print(1)")).parse_program().unwrap();
+        let error = execute(&Environment::global(), &statements, &mut Broken).unwrap_err();
+        assert!(matches!(error, RuntimeError::Output(_)));
+        assert_eq!(error.to_string(), "output error: disk full");
+    }
+
+    #[test]
+    fn a_nested_def_shadows_instead_of_overwriting_the_outer_name() {
+        let script = "g = 1\ndef outer():\ndef g():\nreturn 2\nend\nreturn g()\nend\nprint(outer())\nprint(g)";
+        assert_eq!(output_of(script), "2\n1\n");
+    }
+
+    #[test]
+    fn arguments_bind_to_parameters_by_position() {
+        let script = "def sub(a, b):\nreturn a - b\nend\nprint(sub(10, 3))\n\
+                      def pick(a, b, c):\nreturn a * 100 + b * 10 + c\nend\nprint(pick(1, 2, 3))";
+        assert_eq!(output_of(script), "7\n123\n");
+    }
+
+    #[test]
+    fn operator_mismatches_name_the_operator_and_both_types() {
+        let unit = "def f():\nreturn\nend\n";
+        let cases = [
+            ("print(\"a\" * 1)", "cannot apply `*` to string and integer"),
+            ("print(\"a\" / 1)", "cannot apply `/` to string and integer"),
+            (
+                "print(\"a\" < \"b\")",
+                "cannot apply `<` to string and string",
+            ),
+            (
+                "print(\"a\" > \"b\")",
+                "cannot apply `>` to string and string",
+            ),
+            (
+                "print(\"a\" - \"b\")",
+                "cannot apply `-` to string and string",
+            ),
+            ("print(1 - \"x\")", "cannot apply `-` to integer and string"),
+            ("print(1 * \"x\")", "cannot apply `*` to integer and string"),
+            ("print(true + 1)", "cannot apply `+` to boolean and integer"),
+        ];
+        for (source, message) in cases {
+            assert_eq!(error_of(source), message, "{source:?}");
+        }
+        assert_eq!(
+            error_of(&format!("{unit}print(f() == f())")),
+            "cannot apply `==` to unit and unit"
+        );
+    }
+
+    #[test]
+    fn indexing_checks_the_target_type_before_the_index_type() {
+        let cases = [
+            ("print(5[true])", "cannot index integer"),
+            ("print(5[true:])", "cannot index integer"),
+            (
+                "x = 1\nx[true] = 2",
+                "cannot assign to an element of integer",
+            ),
+            (
+                "print([1][true:\"a\"])",
+                "index must be an integer, found boolean",
+            ),
+        ];
+        for (source, message) in cases {
+            assert_eq!(error_of(source), message, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn every_value_kind_prints_and_reports_itself() {
+        let unit = "def f():\nreturn\nend\n";
+        assert_eq!(
+            output_of(&format!(
+                "{unit}print([f, f(), [], [[]], -1, \"a\" + -2, 1 < 2])\nprint(\"n=\" + -5)\nprint(-5 + \"x\")"
+            )),
+            "[<function f>, unit, [], [[]], -1, \"a-2\", true]\nn=-5\n-5x\n"
+        );
+        let cases = [
+            ("print(-[1])", "cannot negate array"),
+            ("print(-f())", "cannot negate unit"),
+            ("print(-f)", "cannot negate function"),
+            ("print(\"abc\".pop())", "string has no method `pop`"),
+            ("print(true.len())", "boolean has no method `len`"),
+            ("return", "`return` outside of a function"),
+        ];
+        for (source, message) in cases {
+            assert_eq!(error_of(&format!("{unit}{source}")), message, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn postfix_chains_mix_methods_indexes_and_slices_end_to_end() {
+        let script = "ys = [0]\ndef h():\nreturn ys\nend\nh().push(1)\nprint(ys)\n\
+                      xs = [\"ab\", \"c\", \"de\"]\nprint(xs[0].len())\nprint(xs[1:3].len())\n\
+                      zs = [[1, 2], [3]]\nzs[0:2][1].push(9)\nprint(zs)";
+        assert_eq!(output_of(script), "[0, 1]\n2\n2\n[[1, 2], [3, 9]]\n");
+    }
+
+    #[test]
+    fn multiplication_and_division_associate_left() {
+        assert_eq!(output_of("print(8 * 2 / 4)\nprint(8 / 2 * 4)"), "4\n16\n");
     }
 }

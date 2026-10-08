@@ -287,7 +287,10 @@ mod tests {
     fn invalid_utf8_is_reported_without_ending_the_session() {
         let (out, errors) = session(b"x = \xe9\nprint(7)\n");
         assert_eq!(out, ">> >> 7\n>> \n");
-        assert_eq!(errors.lines().count(), 1);
+        assert_eq!(
+            errors,
+            "error: line 1: expected expression, found illegal token\n"
+        );
     }
 
     #[test]
@@ -593,5 +596,67 @@ end
         })
         .unwrap();
         assert_eq!(out, b"1\n");
+    }
+
+    struct FlushCounter {
+        written: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushCounter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_prompt_is_flushed_before_the_session_waits_for_input() {
+        let mut out = FlushCounter {
+            written: Vec::new(),
+            flushes: 0,
+        };
+        repl(
+            &b"print(1)\n"[..],
+            &mut out,
+            Vec::new(),
+            Engine::TreeWalker(Environment::global()),
+            Presentation::PLAIN,
+        )
+        .unwrap();
+        assert_eq!(out.flushes, 2);
+    }
+
+    #[test]
+    fn non_ascii_text_survives_the_session() {
+        let (out, errors) = session("print(\"h\u{e9}llo \u{1f600}\")\n".as_bytes());
+        assert_eq!(out, ">> h\u{e9}llo \u{1f600}\n>> \n");
+        assert_eq!(errors, "");
+    }
+
+    #[test]
+    fn windows_line_endings_run_like_unix_ones() {
+        let (out, errors) = session(b"x = 1\r\nprint(x)\r\n");
+        assert_eq!(out, ">> >> 1\n>> \n");
+        assert_eq!(errors, "");
+    }
+
+    #[test]
+    fn nested_blocks_keep_the_continuation_prompt_until_the_outermost_end() {
+        let (out, errors) = session(b"def f():\nwhile 1 < 0:\nprint(1)\nend\nend\nprint(f())\n");
+        assert_eq!(out, ">> .. .. .. .. >> unit\n>> \n");
+        assert_eq!(errors, "");
+    }
+
+    #[test]
+    fn arrays_stay_shared_across_repl_lines() {
+        let (out, errors) = session(b"a = [1]\nb = a\nb[0] = 9\nprint(a)\n");
+        assert_eq!(out, ">> >> >> >> [9]\n>> \n");
+        assert_eq!(errors, "");
     }
 }
