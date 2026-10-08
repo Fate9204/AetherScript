@@ -437,10 +437,10 @@ fn condition_holds(
 
 pub(crate) fn negate(value: Value) -> Result<Value, RuntimeError> {
     match value {
-        Value::Int(value) => value
-            .checked_neg()
-            .map(Value::Int)
-            .ok_or(RuntimeError::Overflow),
+        Value::Int(value) => match value.checked_neg() {
+            Some(negated) => Ok(Value::Int(negated)),
+            None => Err(RuntimeError::Overflow),
+        },
         other => Err(RuntimeError::InvalidNegation(other.type_name())),
     }
 }
@@ -624,7 +624,10 @@ pub(crate) fn apply_int(op: BinaryOp, left: i64, right: i64) -> Result<Value, Ru
         BinaryOp::Less => return Ok(Value::Bool(left < right)),
         BinaryOp::LessEqual => return Ok(Value::Bool(left <= right)),
     };
-    arithmetic.map(Value::Int).ok_or(RuntimeError::Overflow)
+    match arithmetic {
+        Some(value) => Ok(Value::Int(value)),
+        None => Err(RuntimeError::Overflow),
+    }
 }
 
 fn equality(op: BinaryOp, same: bool) -> Value {

@@ -416,39 +416,96 @@ mod tests {
         }
     }
 
+    fn right_nested(leaf: &str, levels: usize) -> String {
+        format!("{leaf} + (").repeat(levels) + leaf + &")".repeat(levels)
+    }
+
     #[test]
-    fn expressions_deeper_than_the_stack_are_rejected() {
-        let nesting = "1 + (".repeat(STACK_SIZE + 1) + "1" + &")".repeat(STACK_SIZE + 1);
+    fn expressions_deeper_than_the_stack_are_rejected_at_the_exact_boundary() {
+        for leaf in ["1", "x"] {
+            let fits = format!("print({})", right_nested(leaf, STACK_SIZE - 1));
+            assert!(compile(&fits).is_ok(), "{leaf}");
+            let overflows = format!("print({})", right_nested(leaf, STACK_SIZE));
+            assert_eq!(
+                compile(&overflows).unwrap_err(),
+                CompileError::ExpressionTooDeep,
+                "{leaf}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_right_operands_consume_stack_depth() {
+        let flat_sum = ["1"; STACK_SIZE * 2].join(" + ");
+        assert!(compile(&format!("x = {flat_sum}")).is_ok());
+        let negations = "-".repeat(STACK_SIZE * 2);
+        assert!(compile(&format!("x = {negations}1")).is_ok());
+        let condition = right_nested("1", STACK_SIZE - 1);
+        assert!(compile(&format!("while {condition}:\nend")).is_ok());
+        assert!(compile(&format!("if {condition}:\nend")).is_ok());
+    }
+
+    fn print_globals(count: usize) -> String {
+        (0..count).map(|n| format!("print(v{n})\n")).collect()
+    }
+
+    fn print_in_loop(body_statements: usize) -> String {
+        let body = "print(x)\n".repeat(body_statements);
+        format!("x = 1\nwhile x < 2:\n{body}end")
+    }
+
+    #[test]
+    fn a_program_can_name_exactly_as_many_globals_as_a_u16_slot_addresses() {
+        let limit = usize::from(u16::MAX) + 1;
+        assert!(compile(&print_globals(limit)).is_ok());
         assert_eq!(
-            compile(&format!("x = {nesting}")).unwrap_err(),
-            CompileError::ExpressionTooDeep
+            compile(&print_globals(limit + 1)).unwrap_err(),
+            CompileError::TooManyGlobals
         );
-        let fits = "1 + (".repeat(STACK_SIZE - 1) + "1" + &")".repeat(STACK_SIZE - 1);
-        assert!(compile(&format!("x = {fits}")).is_ok());
     }
 
     #[test]
-    fn a_program_cannot_name_more_globals_than_a_u16_slot_addresses() {
-        let source = (0..=usize::from(u16::MAX) + 1)
-            .map(|number| format!("print(v{number})\n"))
-            .collect::<String>();
-        assert_eq!(compile(&source).unwrap_err(), CompileError::TooManyGlobals);
-    }
-
-    #[test]
-    fn a_chunk_cannot_hold_more_constants_than_a_u16_operand_addresses() {
-        let source = "x = 1\n".repeat(usize::from(u16::MAX) + 2);
+    fn a_chunk_can_hold_exactly_as_many_constants_as_a_u16_operand_addresses() {
+        let limit = usize::from(u16::MAX) + 1;
+        assert!(compile(&"x = 1\n".repeat(limit)).is_ok());
         assert_eq!(
-            compile(&source).unwrap_err(),
+            compile(&"x = 1\n".repeat(limit + 1)).unwrap_err(),
             CompileError::TooManyConstants
         );
     }
 
     #[test]
-    fn jump_targets_beyond_a_u16_are_rejected() {
-        let body = "print(x)\n".repeat(usize::from(u16::MAX) / 4 + 1);
-        let source = format!("x = 1\nwhile x < 2:\n{body}end");
-        assert_eq!(compile(&source).unwrap_err(), CompileError::ChunkTooLarge);
+    fn a_jump_may_target_the_last_address_a_u16_holds() {
+        assert!(compile(&print_in_loop(16379)).is_ok());
+        assert_eq!(
+            compile(&print_in_loop(16380)).unwrap_err(),
+            CompileError::ChunkTooLarge
+        );
+    }
+
+    #[test]
+    fn compile_errors_describe_the_limit_that_was_hit() {
+        let cases = [
+            (
+                CompileError::TooManyConstants,
+                "too many constants in one chunk",
+            ),
+            (
+                CompileError::TooManyGlobals,
+                "too many distinct global variables",
+            ),
+            (
+                CompileError::ChunkTooLarge,
+                "jump target beyond the 64 KiB chunk limit",
+            ),
+            (
+                CompileError::ExpressionTooDeep,
+                "expression needs more stack than the virtual machine has",
+            ),
+        ];
+        for (error, message) in cases {
+            assert_eq!(error.to_string(), message);
+        }
     }
 
     #[test]

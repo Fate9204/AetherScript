@@ -109,17 +109,15 @@ fn script_path(arguments: &[String]) -> Option<&str> {
 }
 
 fn main() -> ExitCode {
-    let arguments: Vec<String> = env::args().skip(1).collect();
+    let arguments: Vec<String> = env::args_os()
+        .skip(1)
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
     let presentation = Presentation::detect(&arguments);
-    let session = thread::Builder::new()
-        .stack_size(INTERPRETER_STACK_BYTES)
-        .spawn(move || launch(&arguments, presentation).map_err(|error| error.to_string()));
-    let outcome = match session {
-        Ok(handle) => handle
-            .join()
-            .unwrap_or_else(|payload| panic::resume_unwind(payload)),
-        Err(error) => Err(error.to_string()),
-    };
+    let outcome = on_interpreter_stack(move || {
+        launch(&arguments, presentation).map_err(|error| error.to_string())
+    })
+    .unwrap_or_else(|error| Err(error.to_string()));
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -127,6 +125,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn on_interpreter_stack<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<T> {
+    let session = thread::Builder::new()
+        .stack_size(INTERPRETER_STACK_BYTES)
+        .spawn(job)?;
+    Ok(session
+        .join()
+        .unwrap_or_else(|payload| panic::resume_unwind(payload)))
 }
 
 fn launch(arguments: &[String], presentation: Presentation) -> Result<(), Box<dyn Error>> {
@@ -559,5 +568,30 @@ end
             out.replace(">> ", "").replace(".. ", ""),
             format!("{PRIMES_BELOW_TWENTY}\n")
         );
+    }
+
+    #[test]
+    fn a_stray_end_does_not_swallow_the_next_block() {
+        let (out, errors) = session_with(
+            b"end\nx = 1\nwhile x < 2:\nx = 2\nend\nprint(x)\n",
+            Engine::Bytecode(VirtualMachine::default()),
+        );
+        assert_eq!(out, ">> >> >> .. .. >> 2\n>> \n");
+        assert_eq!(errors.lines().count(), 1);
+    }
+
+    #[test]
+    fn deeply_nested_input_needs_the_large_interpreter_stack() {
+        let depth = 5000;
+        let source = format!("print({}1{})", "(".repeat(depth), ")".repeat(depth));
+        let out = on_interpreter_stack(move || {
+            let mut out = Vec::new();
+            Engine::TreeWalker(Environment::global())
+                .run(&source, &mut out)
+                .unwrap();
+            out
+        })
+        .unwrap();
+        assert_eq!(out, b"1\n");
     }
 }

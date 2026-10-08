@@ -136,7 +136,6 @@ mod tests {
     use crate::compiler::Compiler;
     use crate::evaluator::{Environment, execute};
     use crate::lexer::Lexer;
-    use crate::opcodes::STACK_SIZE;
     use crate::parser::Parser;
 
     fn run(machine: &mut VirtualMachine, source: &str) -> Result<String, Box<dyn Error>> {
@@ -259,6 +258,8 @@ mod tests {
     fn runtime_errors_match_the_language_rules() {
         let cases = [
             ("print(y)", "undefined variable `y`"),
+            ("x = 1\nprint(y)", "undefined variable `y`"),
+            ("print(y)\nx = 1", "undefined variable `y`"),
             ("x = x + 1", "undefined variable `x`"),
             ("print(1 / 0)", "division by zero"),
             ("print(9223372036854775807 + 1)", "integer overflow"),
@@ -311,6 +312,7 @@ mod tests {
         run(&mut machine, "x = 1").unwrap();
         assert!(run(&mut machine, "x = x + (2 + (3 / 0))").is_err());
         assert_eq!(machine.sp, 0);
+        assert!(machine.stack.iter().all(|slot| matches!(slot, Value::Unit)));
         assert_eq!(run(&mut machine, "print(x)").unwrap(), "1\n");
     }
 
@@ -384,5 +386,55 @@ mod tests {
                 "{script:?}"
             );
         }
+    }
+
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_output_stream_surfaces_as_a_runtime_error() {
+        let statements = Parser::new(Lexer::new("print(1)")).parse_program().unwrap();
+        let mut machine = VirtualMachine::default();
+        let chunk = Compiler::new(machine.symbols_mut())
+            .compile(&statements)
+            .unwrap();
+        assert!(matches!(
+            machine.run(&chunk, &mut BrokenPipe),
+            Err(RuntimeError::Output(_))
+        ));
+    }
+
+    #[test]
+    fn globals_defined_by_later_runs_keep_their_own_slots() {
+        let mut machine = VirtualMachine::default();
+        run(&mut machine, "a = 1").unwrap();
+        run(&mut machine, "b = 2").unwrap();
+        assert_eq!(run(&mut machine, "print(a + b)").unwrap(), "3\n");
+    }
+
+    #[test]
+    fn a_long_loop_proves_no_instruction_leaks_a_stack_slot() {
+        let output = output_of("i = 0\nwhile i < 300:\nprint(i)\ni = i + 1\nend");
+        assert_eq!(output.lines().count(), 300);
+        assert!(output.ends_with("299\n"));
+    }
+
+    #[test]
+    fn operands_beyond_one_byte_survive_encoding_and_decoding() {
+        let assignments: String = (0..300).map(|n| format!("v{n} = {n}\n")).collect();
+        let padding = "v1 = v1 + 1\n".repeat(40);
+        let script = format!(
+            "{assignments}i = 0\nwhile i < 3:\n{padding}i = i + 1\nend\nprint(v299)\nprint(v1)"
+        );
+        assert_eq!(output_of(&script), "299\n121\n");
     }
 }
